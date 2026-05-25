@@ -1,0 +1,111 @@
+# convert.py — fully self-contained
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import ultralytics.nn.modules as modules
+import ultralytics.nn.tasks as tasks
+from ultralytics import YOLO
+from ultralytics.nn.modules.conv import Conv
+
+
+# Define directly in __main__ scope — matches how they were saved
+class SimAM(nn.Module):
+    def __init__(self, c1, c2=None, e_lambda=1e-4):
+        super().__init__()
+        self.e_lambda = e_lambda
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        n = w * h - 1
+        mu = x.mean(dim=[2, 3], keepdim=True)
+        x_minus_mu_square = (x - mu) ** 2
+        sigma = x_minus_mu_square.sum(dim=[2, 3], keepdim=True) / n
+        y = x_minus_mu_square / (4 * (sigma + self.e_lambda)) + 0.5
+        return x * torch.sigmoid(y)
+
+
+class ASPP(nn.Module):
+    """Atrous Spatial Pyramid Pooling — multi-scale context aggregation."""
+
+    def __init__(self, c1, c2=None, rates=(1, 6, 12, 18)):
+        super().__init__()
+        c2 = c2 or c1
+        c_mid = c2 // 4  # keep param count reasonable
+        self.branches = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(c1, c_mid, 3, padding=r, dilation=r, bias=False),
+                    nn.BatchNorm2d(c_mid),
+                    nn.SiLU(),
+                )
+                for r in rates
+            ]
+        )
+        self.global_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c1, c_mid, 1, bias=False),
+            nn.BatchNorm2d(c_mid),
+            nn.SiLU(),
+        )
+        self.project = Conv(c_mid * (len(rates) + 1), c2, 1)
+
+    def forward(self, x):
+        size = x.shape[-2:]
+        feats = [b(x) for b in self.branches]
+        g = F.interpolate(
+            self.global_pool(x), size=size, mode="bilinear", align_corners=False
+        )
+        feats.append(g)
+        return self.project(torch.cat(feats, dim=1))
+
+
+# ── FPN (top-down feature refinement) ────────────────────────────────────────
+class FPN(nn.Module):
+    """Lightweight FPN refinement — 1×1 projection then 3×3 refinement."""
+
+    def __init__(self, c1, c2=None):
+        super().__init__()
+        c2 = c2 or c1
+        self.lateral = Conv(c1, c2, 1)
+        self.refine = Conv(c2, c2, 3)
+
+    def forward(self, x):
+        return self.refine(self.lateral(x))
+
+
+# ── PANet (bottom-up path augmentation) ──────────────────────────────────────
+class PANet(nn.Module):
+    """Lightweight PANet bottom-up path — strided conv to downsample."""
+
+    def __init__(self, c1, c2=None):
+        super().__init__()
+        c2 = c2 or c1
+        self.down = Conv(c1, c2, 3, 2)  # stride-2 downsample
+
+    def forward(self, x):
+        return self.down(x)
+
+
+# Register into Ultralytics so YAML parse_model() works too
+
+
+modules.SimAM = SimAM
+modules.ASPP = ASPP
+tasks.SimAM = SimAM
+tasks.ASPP = ASPP
+
+# Now safe to load
+
+
+model = YOLO("best_combine.pt")  # load the model
+model.export(
+    format="onnx",
+    imgsz=640,
+    opset=12,
+    simplify=True,
+    dynamic=False,
+    half=False,
+    batch=1,
+)
+print("Export complete!")
