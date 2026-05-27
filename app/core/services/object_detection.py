@@ -543,7 +543,47 @@ def get_yolo_prediction(image_bytes: bytes, model_path: str, labels_path: str) -
     return get_yolo_prediction_from_frame(_decode_image_bytes(image_bytes), model_path, labels_path)
 
 
-def get_combined_prediction_from_frame(frame_bgr: np.ndarray, model_configs: Dict) -> Dict:
+def _attach_path_planning_result(results: Dict, frame_bgr: np.ndarray, depth_model_path: str) -> Dict:
+    try:
+        from app.core.services.depth_estimation import (
+            load_depth_model, estimate_depth, scale_depth_to_metric
+        )
+        from app.core.services.path_planning import compute_path
+
+        depth_session = load_depth_model(depth_model_path)
+        raw_depth = estimate_depth(depth_session, frame_bgr)
+        h, w = frame_bgr.shape[:2]
+        abs_poly = (
+            ROAD_POLYGON_POINTS_RELATIVE *
+            np.array([w, h], dtype=np.float32)
+        ).astype(np.int32)
+        if any("hazard_level" not in det for det in results.get("detections", [])):
+            analyzed_dets, _ = perform_road_analysis((h, w), results.get("detections", []))
+            results["detections"] = analyzed_dets
+        metric_depth = scale_depth_to_metric(
+            raw_depth, ROAD_POLYGON_POINTS_RELATIVE, (h, w)
+        )
+        results["path_planning"] = compute_path(
+            results["detections"], metric_depth, (h, w), abs_poly
+        )
+    except Exception as e:
+        results["path_planning"] = {
+            "path_found": False,
+            "waypoints": [],
+            "error": str(e),
+        }
+    return results
+
+
+def get_combined_prediction_from_frame(
+    frame_bgr: np.ndarray,
+    model_configs: Dict,
+    use_mc_dropout: bool = False,
+    pt_path: str = None,
+    n_samples: int = 5,
+    depth_model_path: str = None,
+    enable_path_planning: bool = False
+) -> Dict:
     global LAST_INFERENCE_ERROR
     start_time = time.perf_counter()
     active_model_key = get_active_model_name()
@@ -553,6 +593,21 @@ def get_combined_prediction_from_frame(frame_bgr: np.ndarray, model_configs: Dic
 
     model_path = config["path"]
     model_type = config["type"]
+
+    if use_mc_dropout and pt_path and model_type == "YOLO":
+        try:
+            from app.core.services.mc_dropout import load_pt_model, mc_inference
+
+            pt_model, ok = load_pt_model(pt_path)
+            if ok:
+                mc_result = mc_inference(pt_model, frame_bgr, n_samples=n_samples)
+                mc_result["weather_prediction"] = "N/A"
+                mc_result["metrics"] = {"processing_latency_ms": 0}
+                if enable_path_planning and depth_model_path:
+                    _attach_path_planning_result(mc_result, frame_bgr, depth_model_path)
+                return mc_result
+        except Exception as e:
+            print(f"[MC Dropout] Falling back to ONNX inference: {e}")
 
     try:
         if model_type == "FASTER-RCNN":
@@ -577,6 +632,8 @@ def get_combined_prediction_from_frame(frame_bgr: np.ndarray, model_configs: Dic
 
     end_time = time.perf_counter()
     results["metrics"] = {"processing_latency_ms": round((end_time - start_time) * 1000, 2)}
+    if enable_path_planning and depth_model_path:
+        _attach_path_planning_result(results, frame_bgr, depth_model_path)
     return results
 
 
@@ -662,7 +719,12 @@ def perform_road_analysis(frame_shape: tuple, detections: list) -> Tuple[list, n
     return final_detections, abs_polygon_points
 
 
-def draw_main_visualization(frame: np.ndarray, analysis_results: Dict, abs_polygon_points: np.ndarray) -> np.ndarray:
+def draw_main_visualization(
+    frame: np.ndarray,
+    analysis_results: Dict,
+    abs_polygon_points: np.ndarray,
+    show_uncertainty: bool = False
+) -> np.ndarray:
     frame_h, frame_w = frame.shape[:2]
     cv2.polylines(frame, [np.int32(abs_polygon_points)], isClosed=True, color=(0, 255, 255), thickness=2)
     for det in analysis_results.get("detections", []):
@@ -683,6 +745,17 @@ def draw_main_visualization(frame: np.ndarray, analysis_results: Dict, abs_polyg
         label_y = max(th + 2, y1 - 5)
         cv2.rectangle(frame, (x1, label_top), (label_right, y1), color, -1)
         cv2.putText(frame, label_text, (x1, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        if show_uncertainty and "uncertainty" in det:
+            unc = det["uncertainty"]
+            if unc < 0.05:
+                unc_color = (0, 255, 0)
+            elif unc < 0.15:
+                unc_color = (0, 255, 255)
+            else:
+                unc_color = (0, 0, 255)
+            cv2.putText(frame, f"u={unc:.3f}", (x1, min(frame_h - 5, y2 + 15)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, unc_color, 1)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), unc_color, 2)
         if hazard_level != 'out_of_roi' and det.get("distance_m") is not None:
             dist_text = f"{det['distance_m']}m"
             cv2.putText(frame, dist_text, (x1, max(th + 2, label_top - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)

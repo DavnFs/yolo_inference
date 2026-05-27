@@ -9,6 +9,7 @@ import threading
 import time
 from collections import deque
 import random
+import numpy as np
 
 from app.core.services.object_detection import (
     get_combined_prediction_from_frame,
@@ -50,6 +51,12 @@ class DashboardGUI:
         self._canvas_image_id = None
         self._canvas_update_pending = False
         self._latest_canvas_frame = None
+        self.mc_dropout_var = tk.BooleanVar(value=False)
+        self.show_uncertainty_var = tk.BooleanVar(value=True)
+        self.mc_n_samples_var = tk.IntVar(value=5)
+        self.mc_pt_path = None
+        self.path_planning_var = tk.BooleanVar(value=False)
+        self.depth_model_path = None
 
         # --- AUTO-DISCOVERY ---
         base_path = os.path.dirname(__file__)
@@ -166,6 +173,49 @@ class DashboardGUI:
 
         ttk.Button(controls_frame, text="Toggle Theme", command=self._toggle_theme).pack(pady=4, fill=tk.X, ipady=5)
 
+        ttk.Separator(controls_frame, orient="horizontal").pack(fill=tk.X, pady=8)
+        ttk.Label(controls_frame, text="MC Dropout", style="Header.TLabel").pack(anchor="w")
+
+        self.mc_pt_label = ttk.Label(
+            controls_frame, text="No .pt loaded",
+            style="Header.TLabel", foreground="gray"
+        )
+        self.mc_pt_label.pack(fill=tk.X)
+        ttk.Button(controls_frame, text="Load .pt Model",
+                   command=self._load_pt_model).pack(fill=tk.X, pady=2)
+
+        ttk.Checkbutton(controls_frame, text="Enable MC Dropout",
+                        variable=self.mc_dropout_var,
+                        style="TCheckbutton").pack(anchor="w")
+
+        ttk.Checkbutton(controls_frame, text="Show Uncertainty Overlay",
+                        variable=self.show_uncertainty_var,
+                        style="TCheckbutton").pack(anchor="w")
+
+        self.mc_samples_label = ttk.Label(
+            controls_frame, text="N Samples: 5",
+            style="Header.TLabel"
+        )
+        self.mc_samples_label.pack(anchor="w")
+        ttk.Scale(controls_frame, from_=1, to=10,
+                  variable=self.mc_n_samples_var, orient="horizontal",
+                  command=self._on_n_samples_change).pack(fill=tk.X)
+
+        ttk.Separator(controls_frame, orient="horizontal").pack(fill=tk.X, pady=8)
+        ttk.Label(controls_frame, text="Path Planning", style="Header.TLabel").pack(anchor="w")
+
+        self.depth_model_label = ttk.Label(
+            controls_frame, text="No depth model loaded",
+            style="Header.TLabel", foreground="gray"
+        )
+        self.depth_model_label.pack(fill=tk.X)
+        ttk.Button(controls_frame, text="Load Depth Model (.onnx)",
+                   command=self._load_depth_model).pack(fill=tk.X, pady=2)
+
+        ttk.Checkbutton(controls_frame, text="Enable Path Planning",
+                        variable=self.path_planning_var,
+                        style="TCheckbutton").pack(anchor="w")
+
         # --- Status cards ---
         status_cards_frame = ttk.Frame(parent)
         status_cards_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
@@ -175,7 +225,12 @@ class DashboardGUI:
         # --- BEV & OGM placeholders ---
         self.bev_frame = ttk.Frame(parent, style="Card.TFrame")
         self.bev_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 5))
-        ttk.Label(self.bev_frame, text="BEV VIEW", style="Placeholder.TLabel").pack(expand=True)
+        self.bev_canvas = tk.Canvas(self.bev_frame, bg="black", highlightthickness=0)
+        self.bev_canvas.pack(expand=True, fill=tk.BOTH)
+        self._bev_image_id = None
+        self._latest_bev_detections = None
+        self._latest_path_data = None
+        self._bev_update_pending = False
 
         self.ogm_frame = ttk.Frame(parent, style="Card.TFrame")
         self.ogm_frame.grid(row=3, column=0, sticky="nsew", pady=(5, 0))
@@ -203,6 +258,28 @@ class DashboardGUI:
 
     def _on_show_polygon_changed(self):
         self.show_polygon_enabled = bool(self.show_polygon.get())
+
+    def _load_pt_model(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("PyTorch Model", "*.pt")]
+        )
+        if path:
+            self.mc_pt_path = path
+            name = os.path.basename(path)
+            self.mc_pt_label.config(text=name, foreground="green")
+
+    def _on_n_samples_change(self, val):
+        self.mc_samples_label.config(text=f"N Samples: {int(float(val))}")
+
+    def _load_depth_model(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("ONNX Model", "*.onnx")]
+        )
+        if path:
+            self.depth_model_path = path
+            self.depth_model_label.config(
+                text=os.path.basename(path), foreground="green"
+            )
 
     def _refresh_models(self):
         """Rescan models folder and update the dropdown — no restart needed."""
@@ -368,7 +445,17 @@ class DashboardGUI:
             self.master.after(0, lambda: messagebox.showinfo("Benchmark Results", benchmark_text))
 
     def process_and_display_frame(self, frame_bgr):
-        results = get_combined_prediction_from_frame(frame_bgr, self.model_configs)
+        use_mc = self.mc_dropout_var.get() and self.mc_pt_path is not None
+        n_samples = int(self.mc_n_samples_var.get())
+        results = get_combined_prediction_from_frame(
+            frame_bgr,
+            self.model_configs,
+            use_mc_dropout=use_mc,
+            pt_path=self.mc_pt_path,
+            n_samples=n_samples,
+            depth_model_path=self.depth_model_path,
+            enable_path_planning=self.path_planning_var.get()
+        )
         inference_error = results.get("error")
 
         if inference_error:
@@ -382,8 +469,10 @@ class DashboardGUI:
         analyzed_dets, abs_poly = perform_road_analysis(frame_bgr.shape[:2], detections)
         results["detections"] = analyzed_dets
 
+        show_unc = use_mc and self.show_uncertainty_var.get()
         processed_frame = (
-            draw_main_visualization(frame_bgr.copy(), results, abs_poly)
+            draw_main_visualization(frame_bgr.copy(), results, abs_poly,
+                                    show_uncertainty=show_unc)
             if self.show_polygon_enabled else frame_bgr
         )
         self._schedule_canvas_update(processed_frame)
@@ -400,10 +489,15 @@ class DashboardGUI:
             self.fps_queue.append(1 / elapsed)
         avg_fps = sum(self.fps_queue) / len(self.fps_queue) if self.fps_queue else 0
 
-        status_text = f"FPS: {avg_fps:.1f} | Latency: {latency:.0f} ms"
+        mc_tag = f" | MC✓ N={n_samples}" if use_mc else ""
+        status_text = f"FPS: {avg_fps:.1f} | Latency: {latency:.0f} ms{mc_tag}"
         weather_pred = results.get("weather_prediction", "N/A")
         weather_text = weather_pred.capitalize() if weather_pred != "not_applicable" else "N/A"
         self.master.after(0, self._update_status_labels, status_text, weather_text)
+        self._schedule_bev_update(
+            results.get("detections", []),
+            results.get("path_planning")
+        )
         
         return latency, avg_fps
 
@@ -427,6 +521,85 @@ class DashboardGUI:
         if self._latest_canvas_frame is not None and not self._canvas_update_pending:
             self._canvas_update_pending = True
             self.master.after(0, self._flush_canvas_update)
+
+    def _schedule_bev_update(self, detections, path_data=None):
+        self._latest_bev_detections = detections
+        self._latest_path_data = path_data
+        if not self._bev_update_pending:
+            self._bev_update_pending = True
+            self.master.after(0, self._flush_bev_update)
+
+    def _flush_bev_update(self):
+        dets = self._latest_bev_detections
+        path_data = self._latest_path_data
+        self._latest_bev_detections = None
+        self._latest_path_data = None
+        self._bev_update_pending = False
+        if dets is None:
+            return
+
+        from app.core.services.object_detection import (
+            BEV_WIDTH, BEV_HEIGHT, PIXELS_PER_METER, HAZARD_COLORS
+        )
+
+        canvas_w = self.bev_canvas.winfo_width() or BEV_WIDTH
+        canvas_h = self.bev_canvas.winfo_height() or BEV_HEIGHT
+        bev_img = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+
+        cx = canvas_w // 2
+        cv2.line(bev_img, (cx, 0), (cx, canvas_h), (40, 40, 40), 1)
+        cv2.rectangle(bev_img, (cx - 8, canvas_h - 20), (cx + 8, canvas_h - 5),
+                      (0, 180, 180), -1)
+
+        for det in dets:
+            dist = det.get("distance_m", 0)
+            if dist <= 0:
+                continue
+
+            hazard = det.get("hazard_level", "safe")
+            color = HAZARD_COLORS.get(hazard, (128, 128, 128))
+            bbox = det.get("bounding_box", [0, 0, 0, 0])
+            img_cx = (bbox[0] + bbox[2]) / 2
+            x_norm = (img_cx / 640.0) - 0.5
+            x_bev = int(cx + x_norm * canvas_w * 0.8)
+            y_bev = int(canvas_h - dist * PIXELS_PER_METER)
+            y_bev = max(5, min(canvas_h - 5, y_bev))
+
+            radius = 6
+            cv2.circle(bev_img, (x_bev, y_bev), radius, color, -1)
+
+            unc = det.get("uncertainty", 0)
+            if unc >= 0.1:
+                cv2.circle(bev_img, (x_bev, y_bev), radius + 4, (0, 0, 255), 1)
+
+            cv2.putText(bev_img, det.get("label", "")[:4],
+                        (x_bev + 8, y_bev + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
+
+        if path_data and path_data.get("path_found"):
+            waypoints = path_data["waypoints"]
+            for i in range(len(waypoints) - 1):
+                pt1 = (int(waypoints[i][0]), int(waypoints[i][1]))
+                pt2 = (int(waypoints[i + 1][0]), int(waypoints[i + 1][1]))
+                cv2.line(bev_img, pt1, pt2, (0, 200, 255), 2)
+            if waypoints:
+                start_pt = (int(waypoints[0][0]), int(waypoints[0][1]))
+                goal_pt = (int(waypoints[-1][0]), int(waypoints[-1][1]))
+                cv2.circle(bev_img, start_pt, 5, (255, 255, 0), -1)
+                cv2.circle(bev_img, goal_pt, 5, (0, 255, 0), -1)
+        elif path_data and not path_data.get("path_found"):
+            cv2.putText(bev_img, "NO PATH", (10, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+        img_rgb = cv2.cvtColor(bev_img, cv2.COLOR_BGR2RGB)
+        img_pil = Image.fromarray(img_rgb)
+        img_tk = ImageTk.PhotoImage(img_pil)
+        if self._bev_image_id is None:
+            self._bev_image_id = self.bev_canvas.create_image(
+                canvas_w // 2, canvas_h // 2, image=img_tk, anchor=tk.CENTER)
+        else:
+            self.bev_canvas.itemconfig(self._bev_image_id, image=img_tk)
+        self.bev_canvas.image = img_tk
 
     def _update_canvas(self, widget, frame_bgr):
         target_w, target_h = widget.winfo_width(), widget.winfo_height()

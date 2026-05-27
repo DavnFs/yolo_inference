@@ -20,9 +20,11 @@ Thumbs.db
 # Generated outputs and local assets
 output/
 assets/
+tmp_depth*/
 
 # Local models and large ML artifacts
 app/models/
 *.onnx
 *.onnx.data
 *.pt
+*.pth
