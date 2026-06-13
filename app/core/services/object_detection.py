@@ -543,28 +543,27 @@ def get_yolo_prediction(image_bytes: bytes, model_path: str, labels_path: str) -
     return get_yolo_prediction_from_frame(_decode_image_bytes(image_bytes), model_path, labels_path)
 
 
-def _attach_path_planning_result(results: Dict, frame_bgr: np.ndarray, depth_model_path: str) -> Dict:
+def _run_path_planning(
+    results: Dict,
+    frame_bgr: np.ndarray,
+    external_depth: np.ndarray
+) -> Dict:
     try:
-        from app.core.services.depth_estimation import (
-            load_depth_model, estimate_depth, scale_depth_to_metric
-        )
         from app.core.services.path_planning import compute_path
 
-        depth_session = load_depth_model(depth_model_path)
-        raw_depth = estimate_depth(depth_session, frame_bgr)
         h, w = frame_bgr.shape[:2]
+
         abs_poly = (
             ROAD_POLYGON_POINTS_RELATIVE *
             np.array([w, h], dtype=np.float32)
         ).astype(np.int32)
+
         if any("hazard_level" not in det for det in results.get("detections", [])):
             analyzed_dets, _ = perform_road_analysis((h, w), results.get("detections", []))
             results["detections"] = analyzed_dets
-        metric_depth = scale_depth_to_metric(
-            raw_depth, ROAD_POLYGON_POINTS_RELATIVE, (h, w)
-        )
+
         results["path_planning"] = compute_path(
-            results["detections"], metric_depth, (h, w), abs_poly
+            results["detections"], external_depth, (h, w), abs_poly
         )
     except Exception as e:
         results["path_planning"] = {
@@ -581,8 +580,8 @@ def get_combined_prediction_from_frame(
     use_mc_dropout: bool = False,
     pt_path: str = None,
     n_samples: int = 5,
-    depth_model_path: str = None,
-    enable_path_planning: bool = False
+    enable_path_planning: bool = False,
+    external_depth: np.ndarray = None
 ) -> Dict:
     global LAST_INFERENCE_ERROR
     start_time = time.perf_counter()
@@ -603,8 +602,8 @@ def get_combined_prediction_from_frame(
                 mc_result = mc_inference(pt_model, frame_bgr, n_samples=n_samples)
                 mc_result["weather_prediction"] = "N/A"
                 mc_result["metrics"] = {"processing_latency_ms": 0}
-                if enable_path_planning and depth_model_path:
-                    _attach_path_planning_result(mc_result, frame_bgr, depth_model_path)
+                if enable_path_planning and external_depth is not None:
+                    _run_path_planning(mc_result, frame_bgr, external_depth)
                 return mc_result
         except Exception as e:
             print(f"[MC Dropout] Falling back to ONNX inference: {e}")
@@ -632,8 +631,8 @@ def get_combined_prediction_from_frame(
 
     end_time = time.perf_counter()
     results["metrics"] = {"processing_latency_ms": round((end_time - start_time) * 1000, 2)}
-    if enable_path_planning and depth_model_path:
-        _attach_path_planning_result(results, frame_bgr, depth_model_path)
+    if enable_path_planning and external_depth is not None:
+        _run_path_planning(results, frame_bgr, external_depth)
     return results
 
 
@@ -656,18 +655,19 @@ def get_combined_prediction(image_bytes: bytes, model_configs: Dict) -> Dict:
 # ANALYSIS AND VISUALIZATION
 # =============================================================================
 
-def _get_frame_geometry(frame_shape: tuple) -> Tuple[np.ndarray, np.ndarray]:
+def _get_frame_geometry(frame_shape: tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     h, w = frame_shape
     cache_key = (h, w)
     if cache_key not in GEOMETRY_CACHE:
         abs_polygon_points = (ROAD_POLYGON_POINTS_RELATIVE * [w, h]).astype(np.float32)
         perspective_matrix = cv2.getPerspectiveTransform(abs_polygon_points, BEV_DESTINATION_POINTS)
-        GEOMETRY_CACHE[cache_key] = (abs_polygon_points, perspective_matrix)
+        inv_perspective_matrix = cv2.invert(perspective_matrix)[1]
+        GEOMETRY_CACHE[cache_key] = (abs_polygon_points, perspective_matrix, inv_perspective_matrix)
     return GEOMETRY_CACHE[cache_key]
 
 
 def perform_road_analysis(frame_shape: tuple, detections: list) -> Tuple[list, np.ndarray]:
-    abs_polygon_points, perspective_matrix = _get_frame_geometry(frame_shape)
+    abs_polygon_points, perspective_matrix, _ = _get_frame_geometry(frame_shape)
     final_detections = []
 
     if not detections:
@@ -724,7 +724,8 @@ def draw_main_visualization(
     analysis_results: Dict,
     abs_polygon_points: np.ndarray,
     show_uncertainty: bool = False,
-    path_data=None
+    path_data=None,
+    frame_shape: tuple = None
 ) -> np.ndarray:
     frame_h, frame_w = frame.shape[:2]
     cv2.polylines(frame, [np.int32(abs_polygon_points)], isClosed=True, color=(0, 255, 255), thickness=2)
@@ -761,27 +762,31 @@ def draw_main_visualization(
             dist_text = f"{det['distance_m']}m"
             cv2.putText(frame, dist_text, (x1, max(th + 2, label_top - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     if path_data and path_data.get("path_found"):
-        projected_points = []
-        for bev_x, bev_y in path_data.get("waypoints", []):
-            x_norm = ((bev_x - BEV_WIDTH / 2) / (BEV_WIDTH * 0.8)) + 0.5
-            img_x = int(x_norm * frame_w)
-            dist_m = (BEV_HEIGHT - bev_y) / PIXELS_PER_METER
-            img_y = int(frame_h - dist_m * (frame_h / 15.0))
-            if 0 <= img_x < frame_w and 0 <= img_y < frame_h:
-                projected_points.append((img_x, img_y))
+        waypoints = path_data.get("waypoints", [])
+        if len(waypoints) >= 2 and frame_shape is not None:
+            # Use inverse perspective matrix to map BEV waypoints back to camera frame
+            _, _, M_inv = _get_frame_geometry(frame_shape)
+            bev_pts = np.array(waypoints, dtype=np.float32).reshape(-1, 1, 2)
+            camera_pts = cv2.perspectiveTransform(bev_pts, M_inv).reshape(-1, 2)
 
-        if len(projected_points) >= 2:
-            cv2.polylines(
-                frame,
-                [np.array(projected_points, dtype=np.int32)],
-                isClosed=False,
-                color=(0, 255, 255),
-                thickness=3,
-            )
-        for point in projected_points:
-            cv2.circle(frame, point, 4, (0, 200, 255), -1)
-        if projected_points:
-            label_x, label_y = projected_points[0]
-            cv2.putText(frame, "PATH", (label_x, max(15, label_y - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+            projected_points = []
+            for pt in camera_pts:
+                ix, iy = int(round(pt[0])), int(round(pt[1]))
+                if 0 <= ix < frame_w and 0 <= iy < frame_h:
+                    projected_points.append((ix, iy))
+
+            if len(projected_points) >= 2:
+                cv2.polylines(
+                    frame,
+                    [np.array(projected_points, dtype=np.int32)],
+                    isClosed=False,
+                    color=(0, 255, 255),
+                    thickness=3,
+                )
+            for point in projected_points:
+                cv2.circle(frame, point, 4, (0, 200, 255), -1)
+            if projected_points:
+                label_x, label_y = projected_points[0]
+                cv2.putText(frame, "PATH", (label_x, max(15, label_y - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
     return frame

@@ -19,6 +19,61 @@ from app.core.services.object_detection import (
     discover_models  # ← new import
 )
 
+
+class StereoSimLoader:
+    """Ingest stereo dataset pairs (left RGB + 16-bit disparity) and produce metric depth maps."""
+
+    def __init__(self, root_dir: str, fx: float = 721.53, baseline: float = 0.54):
+        self.root_dir = root_dir
+        self.fx = fx
+        self.baseline = baseline
+        self.left_dir = os.path.join(root_dir, "left_images")
+        self.disp_dir = os.path.join(root_dir, "disparity")
+        self._frame_list = []
+        if os.path.isdir(self.left_dir) and os.path.isdir(self.disp_dir):
+            left_files = sorted(f for f in os.listdir(self.left_dir) if f.lower().endswith(".png"))
+            for fname in left_files:
+                if os.path.exists(os.path.join(self.disp_dir, fname)):
+                    self._frame_list.append(fname)
+
+    def is_opened(self) -> bool:
+        return len(self._frame_list) > 0
+
+    def read_frame(self, index: int):
+        """Read the RGB frame and compute metric depth for the given sequential index.
+
+        Returns:
+            (success: bool, frame_bgr: np.ndarray | None, depth_map_m: np.ndarray | None)
+        """
+        if index < 0 or index >= len(self._frame_list):
+            return False, None, None
+
+        fname = self._frame_list[index]
+        left_path = os.path.join(self.left_dir, fname)
+        disp_path = os.path.join(self.disp_dir, fname)
+
+        frame_bgr = cv2.imread(left_path, cv2.IMREAD_COLOR)
+        if frame_bgr is None:
+            return False, None, None
+
+        # 16-bit disparity stored as PNG (DrivingStereo convention)
+        disparity_raw = cv2.imread(disp_path, cv2.IMREAD_UNCHANGED)
+        if disparity_raw is None:
+            return False, None, None
+
+        disparity = disparity_raw.astype(np.float32) / 256.0
+
+        # Guard against division-by-zero / negative disparity
+        disparity = np.where(disparity <= 0.1, 0.1, disparity)
+
+        # Depth = (baseline * fx) / disparity   [meters]
+        depth_m = (self.baseline * self.fx) / disparity
+
+        # Clip to operational range
+        depth_m = np.clip(depth_m, 0.5, 40.0)
+
+        return True, frame_bgr, depth_m
+
 THEMES = {
     "dark":  {"BG": "#212121", "FRAME": "#2E2E2E", "TEXT": "#FFFFFF", "ACCENT": "#00A0A0", "CANVAS": "black",   "BTN_FG": "white", "STATUS": "#2E2E2E", "PLACEHOLDER": "#757575"},
     "light": {"BG": "#F5F5F5", "FRAME": "#FFFFFF", "TEXT": "#000000", "ACCENT": "#00796B", "CANVAS": "#BDBDBD", "BTN_FG": "white", "STATUS": "#E0E0E0", "PLACEHOLDER": "#616161"}
@@ -56,7 +111,7 @@ class DashboardGUI:
         self.mc_n_samples_var = tk.IntVar(value=5)
         self.mc_pt_path = None
         self.path_planning_var = tk.BooleanVar(value=False)
-        self.depth_model_path = None
+        self._frame_img_w = None
 
         # --- AUTO-DISCOVERY ---
         base_path = os.path.dirname(__file__)
@@ -103,20 +158,33 @@ class DashboardGUI:
         self.style.configure("Status.TLabel",     background=colors["STATUS"],foreground=colors["TEXT"],       font=FONTS["normal"], padding=5)
         self.style.configure("Placeholder.TLabel",background=colors["FRAME"], foreground=colors["PLACEHOLDER"],font=FONTS["placeholder"], anchor="center")
         self.main_canvas.config(bg=colors["CANVAS"])
+        if hasattr(self, 'ogm_canvas'):
+            self.ogm_canvas.config(bg=colors["CANVAS"])
 
     # -------------------------------------------------------------------------
 
     def _create_widgets(self):
-        self.master.columnconfigure(0, weight=7)
-        self.master.columnconfigure(1, weight=3, minsize=280)
+        self.master.columnconfigure(0, weight=5)
+        self.master.columnconfigure(1, weight=3, minsize=300)
+        self.master.columnconfigure(2, weight=2, minsize=240)
         self.master.rowconfigure(0, weight=1)
 
+        # Column 0: Main Video Frame Display
         main_display_frame = ttk.Frame(self.master)
         main_display_frame.grid(row=0, column=0, sticky="nsew", padx=(10, 5), pady=10)
         self._create_main_display(main_display_frame)
 
+        # Column 1: Mapping Panel (BEV + OGM stacked)
+        mapping_panel = ttk.Frame(self.master)
+        mapping_panel.grid(row=0, column=1, sticky="nsew", padx=5, pady=10)
+        mapping_panel.rowconfigure(0, weight=1)
+        mapping_panel.rowconfigure(1, weight=1)
+        mapping_panel.columnconfigure(0, weight=1)
+        self._create_mapping_panel(mapping_panel)
+
+        # Column 2: Control Panel
         control_panel_frame = ttk.Frame(self.master)
-        control_panel_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
+        control_panel_frame.grid(row=0, column=2, sticky="nsew", padx=(5, 10), pady=10)
         self._create_control_panel(control_panel_frame)
 
     def _create_main_display(self, parent):
@@ -140,12 +208,32 @@ class DashboardGUI:
         self.status_label = ttk.Label(footer_frame, text="FPS: - | Latency: - ms", style="Status.TLabel")
         self.status_label.pack(side=tk.RIGHT, padx=10)
 
+    def _create_mapping_panel(self, parent):
+        # BEV Canvas (top row)
+        self.bev_frame = ttk.Frame(parent, style="Card.TFrame")
+        self.bev_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 3))
+        self.bev_canvas = tk.Canvas(self.bev_frame, bg="black", highlightthickness=0)
+        self.bev_canvas.pack(expand=True, fill=tk.BOTH)
+        self._bev_image_id = None
+        self._latest_bev_detections = None
+        self._latest_path_data = None
+        self._bev_update_pending = False
+
+        # OGM Canvas (bottom row) - live occupancy grid
+        self.ogm_frame = ttk.Frame(parent, style="Card.TFrame")
+        self.ogm_frame.grid(row=1, column=0, sticky="nsew", pady=(3, 0))
+        self.ogm_canvas = tk.Canvas(self.ogm_frame, bg="black", highlightthickness=0)
+        self.ogm_canvas.pack(expand=True, fill=tk.BOTH)
+        self._ogm_image_id = None
+        self._latest_ogm_grid = None
+        self._latest_ogm_path = None
+        self._ogm_update_pending = False
+
     def _create_control_panel(self, parent):
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=0)
         parent.rowconfigure(1, weight=0)
         parent.rowconfigure(2, weight=1)
-        parent.rowconfigure(3, weight=1)
 
         # --- Controls card ---
         controls_frame = ttk.Frame(parent, style="Card.TFrame", padding=10)
@@ -161,7 +249,7 @@ class DashboardGUI:
 
         self.mode_combo = ttk.Combobox(
             controls_frame,
-            values=["Select Source...", "Image File", "Video File", "Webcam"],
+            values=["Select Source...", "Image File", "Video File", "Webcam", "Stereo Dataset Sim"],
             state="readonly", width=20
         )
         self.mode_combo.set("Select Source...")
@@ -204,15 +292,7 @@ class DashboardGUI:
         ttk.Separator(controls_frame, orient="horizontal").pack(fill=tk.X, pady=8)
         ttk.Label(controls_frame, text="Path Planning", style="Header.TLabel").pack(anchor="w")
 
-        self.depth_model_label = ttk.Label(
-            controls_frame, text="No depth model loaded",
-            style="Header.TLabel", foreground="gray"
-        )
-        self.depth_model_label.pack(fill=tk.X)
-        ttk.Button(controls_frame, text="Load Depth Model (.onnx)",
-                   command=self._load_depth_model).pack(fill=tk.X, pady=2)
-
-        ttk.Checkbutton(controls_frame, text="Enable Path Planning",
+        ttk.Checkbutton(controls_frame, text="Enable Path Planning (Stereo)",
                         variable=self.path_planning_var,
                         style="TCheckbutton").pack(anchor="w")
 
@@ -222,19 +302,7 @@ class DashboardGUI:
         status_cards_frame.columnconfigure(0, weight=1)
         self._create_status_cards_panel(status_cards_frame)
 
-        # --- BEV & OGM placeholders ---
-        self.bev_frame = ttk.Frame(parent, style="Card.TFrame")
-        self.bev_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 5))
-        self.bev_canvas = tk.Canvas(self.bev_frame, bg="black", highlightthickness=0)
-        self.bev_canvas.pack(expand=True, fill=tk.BOTH)
-        self._bev_image_id = None
-        self._latest_bev_detections = None
-        self._latest_path_data = None
-        self._bev_update_pending = False
 
-        self.ogm_frame = ttk.Frame(parent, style="Card.TFrame")
-        self.ogm_frame.grid(row=3, column=0, sticky="nsew", pady=(5, 0))
-        ttk.Label(self.ogm_frame, text="Occupancy Grid Mapping", style="Placeholder.TLabel").pack(expand=True)
 
     def _create_status_cards_panel(self, parent):
         self.speed_label    = self._create_status_card(parent, 0, "SPEED",    "0 Km/h")
@@ -271,16 +339,6 @@ class DashboardGUI:
     def _on_n_samples_change(self, val):
         self.mc_samples_label.config(text=f"N Samples: {int(float(val))}")
 
-    def _load_depth_model(self):
-        path = filedialog.askopenfilename(
-            filetypes=[("ONNX Model", "*.onnx")]
-        )
-        if path:
-            self.depth_model_path = path
-            self.depth_model_label.config(
-                text=os.path.basename(path), foreground="green"
-            )
-
     def _refresh_models(self):
         """Rescan models folder and update the dropdown — no restart needed."""
         base_path = os.path.dirname(__file__)
@@ -307,6 +365,10 @@ class DashboardGUI:
                 self.mode_combo.set("Select Source...")
         elif mode == "Webcam":
             self.source_path = 0
+        elif mode == "Stereo Dataset Sim":
+            self.source_path = filedialog.askdirectory(title="Select Stereo Dataset Root (with left_images/ and disparity/ subfolders)")
+            if not self.source_path:
+                self.mode_combo.set("Select Source...")
 
     def toggle_processing(self):
         if self.processing_thread and self.processing_thread.is_alive():
@@ -352,17 +414,33 @@ class DashboardGUI:
             self.master.after(0, lambda: messagebox.showerror("Error", "Source path is not set."))
             self.master.after(0, self.stop_processing)
             return
-        source = cv2.VideoCapture(self.source_path)
-        if mode == "Webcam":
-            source.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if not source.isOpened():
-            self.master.after(0, lambda: messagebox.showerror("Error", "Could not open video/image source."))
-            self.master.after(0, self.stop_processing)
-            return
+
+        # --- Branch: Stereo Dataset Sim vs. standard video/image sources ---
+        is_stereo_sim = (mode == "Stereo Dataset Sim")
+        stereo_loader = None
+        source = None
+
+        if is_stereo_sim:
+            stereo_loader = StereoSimLoader(self.source_path)
+            if not stereo_loader.is_opened():
+                self.master.after(0, lambda: messagebox.showerror(
+                    "Error",
+                    "No matching left_images/ and disparity/ .png pairs found in the selected folder."
+                ))
+                self.master.after(0, self.stop_processing)
+                return
+        else:
+            source = cv2.VideoCapture(self.source_path)
+            if mode == "Webcam":
+                source.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if not source.isOpened():
+                self.master.after(0, lambda: messagebox.showerror("Error", "Could not open video/image source."))
+                self.master.after(0, self.stop_processing)
+                return
 
         source_fps = 0.0
         frame_interval = 0.0
-        if mode == "Video File":
+        if mode == "Video File" and source is not None:
             source_fps = float(source.get(cv2.CAP_PROP_FPS) or 0.0)
             if source_fps != source_fps or source_fps <= 0.0:
                 source_fps = 30.0
@@ -378,18 +456,25 @@ class DashboardGUI:
         fps_history = []
             
         while not self.stop_processing_flag.is_set():
-            ret, frame = source.read()
-            if not ret:
-                break
+            # --- Read frame from the appropriate source ---
+            simulated_depth = None
+            if is_stereo_sim:
+                ret, frame, simulated_depth = stereo_loader.read_frame(frames_read)
+                if not ret:
+                    break
+            else:
+                ret, frame = source.read()
+                if not ret:
+                    break
                 
             frames_read += 1
             processed_frames_count += 1
-            latency, frame_fps = self.process_and_display_frame(frame)
+            latency, frame_fps = self.process_and_display_frame(frame, external_depth=simulated_depth)
             latency_history.append(latency)
             if frame_fps > 0:
                 fps_history.append(frame_fps)
 
-            if mode == "Video File":
+            if mode == "Video File" and source is not None:
                 target_time = start_time + (frames_read * frame_interval)
                 delay = target_time - time.perf_counter()
                 if delay > 0:
@@ -410,7 +495,8 @@ class DashboardGUI:
                 break
         
         total_time = time.perf_counter() - start_time
-        source.release()
+        if source is not None:
+            source.release()
         
         if not self.stop_processing_flag.is_set():
             self.master.after(0, self.stop_processing)
@@ -444,7 +530,9 @@ class DashboardGUI:
             )
             self.master.after(0, lambda: messagebox.showinfo("Benchmark Results", benchmark_text))
 
-    def process_and_display_frame(self, frame_bgr):
+    def process_and_display_frame(self, frame_bgr, external_depth=None):
+        if self._frame_img_w is None:
+            self._frame_img_w = frame_bgr.shape[1]
         use_mc = self.mc_dropout_var.get() and self.mc_pt_path is not None
         n_samples = int(self.mc_n_samples_var.get())
         results = get_combined_prediction_from_frame(
@@ -453,8 +541,8 @@ class DashboardGUI:
             use_mc_dropout=use_mc,
             pt_path=self.mc_pt_path,
             n_samples=n_samples,
-            depth_model_path=self.depth_model_path,
-            enable_path_planning=self.path_planning_var.get()
+            enable_path_planning=self.path_planning_var.get(),
+            external_depth=external_depth
         )
         inference_error = results.get("error")
 
@@ -474,7 +562,8 @@ class DashboardGUI:
         processed_frame = (
             draw_main_visualization(frame_bgr.copy(), results, abs_poly,
                                     show_uncertainty=show_unc,
-                                    path_data=path_data)
+                                    path_data=path_data,
+                                    frame_shape=frame_bgr.shape[:2])
             if self.show_polygon_enabled else frame_bgr
         )
         self._schedule_canvas_update(processed_frame)
@@ -530,6 +619,13 @@ class DashboardGUI:
         if not self._bev_update_pending:
             self._bev_update_pending = True
             self.master.after(0, self._flush_bev_update)
+        # Also schedule OGM update if path data includes obstacle_grid
+        if path_data and "obstacle_grid" in path_data:
+            self._latest_ogm_grid = path_data["obstacle_grid"]
+            self._latest_ogm_path = path_data
+            if not self._ogm_update_pending:
+                self._ogm_update_pending = True
+                self.master.after(0, self._flush_ogm_update)
 
     def _flush_bev_update(self):
         dets = self._latest_bev_detections
@@ -548,10 +644,22 @@ class DashboardGUI:
         canvas_h = self.bev_canvas.winfo_height() or BEV_HEIGHT
         bev_img = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
 
-        cx = canvas_w // 2
-        cv2.line(bev_img, (cx, 0), (cx, canvas_h), (40, 40, 40), 1)
-        cv2.rectangle(bev_img, (cx - 8, canvas_h - 20), (cx + 8, canvas_h - 5),
+        # Scale factors from BEV grid space -> canvas pixel space
+        scale_x = canvas_w / BEV_WIDTH
+        scale_y = canvas_h / BEV_HEIGHT
+
+        # Ego vehicle centerline and marker (in canvas coords)
+        cx_canvas = int(BEV_WIDTH // 2 * scale_x)
+        cv2.line(bev_img, (cx_canvas, 0), (cx_canvas, canvas_h), (40, 40, 40), 1)
+        cv2.rectangle(bev_img,
+                      (cx_canvas - 8, canvas_h - 20),
+                      (cx_canvas + 8, canvas_h - 5),
                       (0, 180, 180), -1)
+
+        # Pinhole camera intrinsics (must match path_planning.py)
+        fx = 721.53
+        orig_w = self._frame_img_w or 640
+        cx_img = orig_w // 2
 
         for det in dets:
             dist = det.get("distance_m", 0)
@@ -561,10 +669,16 @@ class DashboardGUI:
             hazard = det.get("hazard_level", "safe")
             color = HAZARD_COLORS.get(hazard, (128, 128, 128))
             bbox = det.get("bounding_box", [0, 0, 0, 0])
-            img_cx = (bbox[0] + bbox[2]) / 2
-            x_norm = (img_cx / 640.0) - 0.5
-            x_bev = int(cx + x_norm * canvas_w * 0.8)
-            y_bev = int(canvas_h - dist * PIXELS_PER_METER)
+
+            # Pinhole projection: same formula as build_occupancy_grid
+            bbox_cx = (bbox[0] + bbox[2]) * 0.5
+            X_meters = ((bbox_cx - cx_img) * dist) / fx
+
+            # Map to BEV grid coordinates, then scale to canvas
+            x_grid = int(BEV_WIDTH // 2 + X_meters * PIXELS_PER_METER)
+            y_grid = int(BEV_HEIGHT - dist * PIXELS_PER_METER)
+            x_bev = int(x_grid * scale_x)
+            y_bev = int(y_grid * scale_y)
             y_bev = max(5, min(canvas_h - 5, y_bev))
 
             radius = 6
@@ -579,21 +693,16 @@ class DashboardGUI:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
 
         if path_data and path_data.get("path_found"):
-            scale_x = canvas_w / BEV_WIDTH
-            scale_y = canvas_h / BEV_HEIGHT
             scaled_waypoints = [
                 (int(wx * scale_x), int(wy * scale_y))
                 for wx, wy in path_data["waypoints"]
             ]
             for i in range(len(scaled_waypoints) - 1):
-                pt1 = (int(scaled_waypoints[i][0]), int(scaled_waypoints[i][1]))
-                pt2 = (int(scaled_waypoints[i + 1][0]), int(scaled_waypoints[i + 1][1]))
-                cv2.line(bev_img, pt1, pt2, (0, 200, 255), 2)
+                cv2.line(bev_img, scaled_waypoints[i], scaled_waypoints[i + 1],
+                         (0, 200, 255), 2)
             if scaled_waypoints:
-                start_pt = (int(scaled_waypoints[0][0]), int(scaled_waypoints[0][1]))
-                goal_pt = (int(scaled_waypoints[-1][0]), int(scaled_waypoints[-1][1]))
-                cv2.circle(bev_img, start_pt, 5, (255, 255, 0), -1)
-                cv2.circle(bev_img, goal_pt, 5, (0, 255, 0), -1)
+                cv2.circle(bev_img, scaled_waypoints[0], 5, (255, 255, 0), -1)
+                cv2.circle(bev_img, scaled_waypoints[-1], 5, (0, 255, 0), -1)
         elif path_data and not path_data.get("path_found"):
             cv2.putText(bev_img, "NO PATH", (10, 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
@@ -607,6 +716,58 @@ class DashboardGUI:
         else:
             self.bev_canvas.itemconfig(self._bev_image_id, image=img_tk)
         self.bev_canvas.image = img_tk
+
+    def _flush_ogm_update(self):
+        grid = self._latest_ogm_grid
+        path_data = self._latest_ogm_path
+        self._latest_ogm_grid = None
+        self._latest_ogm_path = None
+        self._ogm_update_pending = False
+        if grid is None:
+            return
+
+        canvas_w = self.ogm_canvas.winfo_width() or 200
+        canvas_h = self.ogm_canvas.winfo_height() or 200
+        if canvas_w < 2 or canvas_h < 2:
+            return
+
+        # Build RGB image directly from the obstacle_grid array
+        # grid is BEV_HEIGHT x BEV_WIDTH, uint8 where 255 = obstacle
+        ogm_rgb = np.zeros((grid.shape[0], grid.shape[1], 3), dtype=np.uint8)
+        ogm_rgb[grid > 127] = [0, 255, 255]   # cyan for inflated obstacles
+        ogm_rgb[grid > 200] = [0, 0, 255]     # red for high-confidence obstacles
+
+        # Overlay A* waypoints directly on the grid image (BEV coords)
+        if path_data and path_data.get("path_found"):
+            waypoints = path_data.get("waypoints", [])
+            for i in range(len(waypoints) - 1):
+                pt1 = (int(waypoints[i][0]), int(waypoints[i][1]))
+                pt2 = (int(waypoints[i + 1][0]), int(waypoints[i + 1][1]))
+                cv2.line(ogm_rgb, pt1, pt2, (0, 200, 255), 2)
+            if waypoints:
+                cv2.circle(ogm_rgb, (int(waypoints[0][0]), int(waypoints[0][1])),
+                           4, (255, 255, 0), -1)
+                cv2.circle(ogm_rgb, (int(waypoints[-1][0]), int(waypoints[-1][1])),
+                           4, (0, 255, 0), -1)
+
+        # Ego vehicle marker at bottom-center of the grid
+        h, w = ogm_rgb.shape[:2]
+        cv2.rectangle(ogm_rgb, (w // 2 - 6, h - 15), (w // 2 + 6, h - 5),
+                      (0, 180, 180), -1)
+
+        # Resize to canvas using INTER_NEAREST to preserve crisp obstacle boundaries
+        resized = cv2.resize(ogm_rgb, (canvas_w, canvas_h),
+                             interpolation=cv2.INTER_NEAREST)
+        img_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        img_tk = ImageTk.PhotoImage(image=Image.fromarray(img_rgb))
+        if self._ogm_image_id is None:
+            self._ogm_image_id = self.ogm_canvas.create_image(
+                canvas_w // 2, canvas_h // 2, image=img_tk, anchor=tk.CENTER)
+        else:
+            self.ogm_canvas.coords(self._ogm_image_id,
+                                   canvas_w // 2, canvas_h // 2)
+            self.ogm_canvas.itemconfig(self._ogm_image_id, image=img_tk)
+        self.ogm_canvas.image = img_tk
 
     def _update_canvas(self, widget, frame_bgr):
         target_w, target_h = widget.winfo_width(), widget.winfo_height()

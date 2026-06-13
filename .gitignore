@@ -2,6 +2,10 @@
 __pycache__/
 *.py[cod]
 *$py.class
+# Agentic
+.agents
+.commandcode
+plan.md
 
 # Virtual environments
 .venv/
@@ -20,6 +24,7 @@ Thumbs.db
 # Generated outputs and local assets
 output/
 assets/
+stereo_dataset/
 tmp_depth*/
 
 # Local models and large ML artifacts
