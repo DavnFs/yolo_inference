@@ -81,7 +81,9 @@ def build_occupancy_grid(
     cv2.fillPoly(road_mask, [road_polygon_abs.astype(np.int32)], 255)
 
     # Ambil index piksel yang memenuhi syarat kontur dekat secara instan via NumPy
-    depth_indices = np.where((metric_depth_map < 3.0) & (road_mask > 0))
+    # Filter: hanya 2.5m–15m untuk menghilangkan ego-hood dan noise jauh
+    depth_mask = (metric_depth_map >= 2.5) & (metric_depth_map < 15.0) & (road_mask > 0)
+    depth_indices = np.where(depth_mask)
 
     if len(depth_indices[0]) > 0:
         py_nodes = depth_indices[0]
@@ -104,6 +106,9 @@ def build_occupancy_grid(
         )
 
         grid[y_bev_nodes[valid_mask], x_bev_nodes[valid_mask]] = 255
+
+    # Bersihkan baris paling bawah BEV (ego-hood noise zone)
+    grid[BEV_HEIGHT - 30:, :] = 0
 
     # 3. INFLATION LAYER (Penebalan rintangan demi keselamatan fisik robot)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
@@ -253,20 +258,45 @@ def compute_path(
         (center_x + 20, BEV_HEIGHT - 10),
     ]
 
-    # --- Dynamic Horizon Goal Placement ---
-    # Scan the top rows (y=10..30) for the center of the widest open lane.
-    horizon_y_start, horizon_y_end = 10, 31
-    goal_candidates: List[Tuple[int, int]] = []
-    for y_h in range(horizon_y_start, horizon_y_end):
-        row = grid[y_h, :]
-        valid_cols = np.where(row <= 200)[0]
-        if len(valid_cols) > 0:
-            mid = int(valid_cols[len(valid_cols) // 2])
-            goal_candidates.append((mid, y_h))
+    # --- Emergency Stop: immediate front fully blocked ---
+    front_zone = grid[BEV_HEIGHT - 60:BEV_HEIGHT, :]
+    front_blocked = np.all(front_zone > 200)
 
-    # Fallback if no open lane found at horizon
-    if not goal_candidates:
-        goal_candidates = [(center_x, 10)]
+    if front_blocked:
+        stop_point = (center_x, BEV_HEIGHT - 10)
+        return {
+            "waypoints": [stop_point],
+            "path_points": [stop_point],
+            "smooth_path": [stop_point],
+            "path_found": False,
+            "obstacle_grid": grid,
+            "compute_time_ms": 0.0,
+            "road_coverage_ratio": 0.0,
+        }
+
+    # --- Center-Lane Bias: default straight-ahead goal ---
+    straight_goal = (center_x, 15)
+
+    # Ego-lane corridor check: columns center_x±15, rows 50..BEV_HEIGHT
+    ego_left = max(0, center_x - 15)
+    ego_right = min(BEV_WIDTH, center_x + 15)
+    ego_corridor = grid[50:BEV_HEIGHT, ego_left:ego_right]
+    ego_lane_blocked = np.any(ego_corridor > 200)
+
+    if not ego_lane_blocked:
+        # Road ahead is clear — drive straight
+        goal_candidates = [straight_goal]
+    else:
+        # Ego-lane blocked — try alternate lane midpoints at horizon
+        goal_candidates = []
+        for y_h in range(10, 31):
+            row = grid[y_h, :]
+            valid_cols = np.where(row <= 200)[0]
+            if len(valid_cols) > 0:
+                mid = int(valid_cols[len(valid_cols) // 2])
+                goal_candidates.append((mid, y_h))
+        if not goal_candidates:
+            goal_candidates = [straight_goal]
 
     t0 = time.perf_counter()
     path = []
