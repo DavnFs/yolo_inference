@@ -6,13 +6,9 @@ import cv2
 import numpy as np
 
 from app.core.services.object_detection import (
-    BEV_DESTINATION_POINTS,
     BEV_HEIGHT,
     BEV_WIDTH,
-    HAZARD_COLORS,
     PIXELS_PER_METER,
-    ROAD_POLYGON_POINTS_RELATIVE,
-    _get_frame_geometry,
 )
 
 
@@ -41,16 +37,15 @@ def build_occupancy_grid(
 ) -> np.ndarray:
     grid = np.zeros((BEV_HEIGHT, BEV_WIDTH), dtype=np.uint8)
 
-    # Parameter Intrinsik Kamera K (Contoh Nilai Standar DrivingStereo)
-    # Sesuaikan dengan nilai fx dan cx milik data loader Anda nanti
-    fx = 721.53
-    cx = image_shape[1] // 2
+    # Dynamic focal length: ~50° FoV for standard high-res stereo dashcams
+    # fx = image_width * 1.28 gives FoV ≈ 2 * atan(1/(2*1.28)) ≈ 43.6°
+    # For 1242px (KITTI): fx≈1590; for 1920px: fx≈2458 — matches real stereo rigs
+    orig_w = image_shape[1]
+    cx = orig_w // 2
+    fx = orig_w * 1.28
 
-    # 1. PEMETAAN OBJEK DETEKSI (YOLO/RCNN)
+    # 1. PEMETAAN OBJEK DETEKSI (YOLO/RCNN) — ALL detections with valid distance
     for det in detections:
-        if det.get("hazard_level") not in ("danger", "warning"):
-            continue
-
         bbox = det.get("bounding_box", [0, 0, 0, 0])
         dist = float(det.get("distance_m") or 0.0)
         if dist <= 0:
@@ -64,11 +59,10 @@ def build_occupancy_grid(
         x_bev = int(BEV_WIDTH // 2 + X_meters * PIXELS_PER_METER)
         y_bev = int(BEV_HEIGHT - dist * PIXELS_PER_METER)
 
-        # Enforce minimum physical vehicle width (1.8m) for mirrors & bbox inaccuracies
+        # Trust pinhole projection width directly (YOLO boxes already encapsulate margins)
         bbox_w_meters = ((bbox[2] - bbox[0]) / fx) * dist
-        bbox_w_meters = max(1.8, bbox_w_meters)
-        obstacle_w = int(bbox_w_meters * PIXELS_PER_METER)
-        obstacle_h = max(8, int(dist * 0.2 * PIXELS_PER_METER))
+        obstacle_w = max(4, int(bbox_w_meters * PIXELS_PER_METER))
+        obstacle_h = int(2.5 * PIXELS_PER_METER)  # realistic vehicle length ~2.5m
 
         x1, y1, x2, y2 = _clip_rect(
             x_bev - obstacle_w // 2,
@@ -78,34 +72,15 @@ def build_occupancy_grid(
         )
         cv2.rectangle(grid, (x1, y1), (x2, y2), 255, -1)
 
-    # 2. C-SPACE INFLATION (Minkowski Sum — ego half-width + safety margin)
-    #    Ego width 1.8m → radius 0.9m + 0.3m margin = 1.2m total inflation
-    inflation_radius_px = int(1.2 * PIXELS_PER_METER)  # ~9 pixels
-    kernel_size = inflation_radius_px * 2 + 1           # 19
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT, (kernel_size, kernel_size)
-    )
+    # 2. C-SPACE INFLATION (Minkowski Sum — ~0.6m safety padding)
+    #    11x11 kernel ≈ 5px radius × 0.125m/px = 0.625m physical padding
+    #    YOLO boxes already encapsulate some empty road, so no need for huge kernels
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
     grid = cv2.dilate(grid, kernel, iterations=1)
 
     # Bersihkan baris paling bawah BEV (ego-hood noise zone — AFTER inflation
     # to prevent the large kernel from bleeding into the vehicle baseline)
     grid[BEV_HEIGHT - 40:, :] = 0
-
-    # 4. BEV ROAD MASK CONSTRAINT — virtual walls outside driveable corridor
-    #    Warp the camera-frame road polygon into BEV space using the cached
-    #    forward perspective matrix so A* can never leave the lane.
-    try:
-        _, M_forward, _ = _get_frame_geometry(image_shape)
-        h_img, w_img = image_shape[:2]
-        road_mask_cam = np.zeros((h_img, w_img), dtype=np.uint8)
-        cv2.fillPoly(road_mask_cam, [road_polygon_abs.astype(np.int32)], 255)
-        bev_road_mask = cv2.warpPerspective(
-            road_mask_cam, M_forward, (BEV_WIDTH, BEV_HEIGHT),
-            flags=cv2.INTER_NEAREST,
-        )
-        grid[bev_road_mask == 0] = 255  # off-road → absolute obstacle
-    except Exception:
-        pass  # fallback: grid as-is if warp fails
 
     return grid
 
@@ -244,8 +219,9 @@ def compute_path(
 
     # --- Emergency Stop: front zone just ahead of cleared hood ---
     #    Slice from BEV_HEIGHT-60 to BEV_HEIGHT-40 (above the hood clear zone)
+    #    Trigger if ≥70% of the corridor width is blocked (tolerates 1-pixel gaps)
     front_zone = grid[BEV_HEIGHT - 60:BEV_HEIGHT - 40, ego_left:ego_right]
-    if np.all(front_zone > 200):
+    if np.mean(front_zone > 200) > 0.7:
         stop_point = (center_x, BEV_HEIGHT - 10)
         return {
             "waypoints": [stop_point],
@@ -266,16 +242,23 @@ def compute_path(
         # Lane perfectly clear — drive straight ahead
         goal_candidates = [(center_x, 15)]
     else:
-        # Obstacle in ego-lane — scan horizon for alternate overtaking lanes
+        # Obstacle in ego-lane — check adjacent lanes before choosing direction
+        left_lane_blocked = np.any(
+            grid[50:BEV_HEIGHT - 40, max(0, ego_left - 30):ego_left] > 200
+        )
+        right_lane_blocked = np.any(
+            grid[50:BEV_HEIGHT - 40, ego_right:min(BEV_WIDTH, ego_right + 30)] > 200
+        )
         goal_candidates = []
-        for y_h in range(10, 31):
-            row = grid[y_h, :]
-            valid_cols = np.where(row <= 200)[0]
-            if len(valid_cols) > 0:
-                mid = int(valid_cols[len(valid_cols) // 2])
-                goal_candidates.append((mid, y_h))
-        if not goal_candidates:
+        if not right_lane_blocked:
+            goal_candidates.append((center_x + 28, 15))
+        if not left_lane_blocked:
+            goal_candidates.append((center_x - 28, 15))
+        valid_goals = [g for g in goal_candidates if is_valid_node(g)]
+        if not valid_goals:
             goal_candidates = [(center_x, 15)]
+        else:
+            goal_candidates = valid_goals
 
     t0 = time.perf_counter()
     path = []

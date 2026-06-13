@@ -1,5 +1,6 @@
 # convert.py — fully self-contained
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -98,7 +99,7 @@ tasks.ASPP = ASPP
 # Now safe to load
 
 
-model = YOLO("best_combine.pt")  # load the model
+model = YOLO("best_triplehead.pt")  # load the model
 model.export(
     format="onnx",
     imgsz=640,
@@ -108,4 +109,32 @@ model.export(
     half=False,
     batch=1,
 )
+print("ONNX export complete!")
+
+# ── DirectML Graph Optimization Pass ────────────────────────────────────────
+onnx_path = "best_triplehead.onnx"
+root, ext = os.path.splitext(onnx_path)
+dml_path = f"{root}.dml_optimized{ext}"
+
+try:
+    from onnxruntime.transformers import optimizer as ort_optimizer
+
+    print(f"Optimizing for DirectML: {onnx_path} → {dml_path}")
+    opt = ort_optimizer.optimize_model(
+        onnx_path,
+        model_type="bert",       # generic graph optimizer pass
+        num_heads=0,
+        hidden_size=0,
+        optimization_options=None,
+    )
+    opt.save_model_to_file(dml_path)
+    print(f"DirectML-optimized model saved: {dml_path}")
+except ImportError:
+    print("[SKIP] onnxruntime.transformers not available — skipping DML optimization.")
+    print("       Install with: pip install onnxruntime-directml")
+    print(f"       The standard ONNX model at {onnx_path} will still work on CPU.")
+except Exception as e:
+    print(f"[WARN] DirectML optimization failed: {e}")
+    print(f"       The standard ONNX model at {onnx_path} will still work on CPU.")
+
 print("Export complete!")

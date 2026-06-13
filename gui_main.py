@@ -72,6 +72,14 @@ class StereoSimLoader:
         # Clip to operational range
         depth_m = np.clip(depth_m, 0.5, 40.0)
 
+        # Downscale to max 640px width — reduces array payload ~85%
+        # Dynamic fx in path_planning.py auto-adapts to new orig_w
+        target_w = 640
+        ratio = target_w / frame_bgr.shape[1]
+        target_h = int(frame_bgr.shape[0] * ratio)
+        frame_bgr = cv2.resize(frame_bgr, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        depth_m = cv2.resize(depth_m, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+
         return True, frame_bgr, depth_m
 
 THEMES = {
