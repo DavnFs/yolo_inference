@@ -565,13 +565,29 @@ def _run_path_planning(
         # Override homography distance with true stereo depth for each detection
         for det in results.get("detections", []):
             x1, y1, x2, y2 = det.get("bounding_box", [0, 0, 0, 0])
-            # Sample at the vehicle's lower bumper area
+            # Fallback center sample (used only if the bumper patch is invalid)
             cx_det = int((x1 + x2) / 2)
             cy_det = int(y1 + (y2 - y1) * 0.8)
-            # Clamp to frame bounds
             cx_det = max(0, min(w - 1, cx_det))
             cy_det = max(0, min(h - 1, cy_det))
             true_dist = float(external_depth[cy_det, cx_det])
+
+            # Robust bumper patch: middle 50% width × bottom 75-85% height.
+            # Median of valid pixels filters out background bleed (sidewalks, sky,
+            # lane markings) that single-pixel center samples often hit.
+            bw = x2 - x1
+            bh = y2 - y1
+            px1 = max(0, int(x1 + bw * 0.25))
+            px2 = min(w, int(x1 + bw * 0.75))
+            py1 = max(0, int(y1 + bh * 0.75))
+            py2 = min(h, int(y1 + bh * 0.85))
+
+            if px2 > px1 and py2 > py1:
+                patch = external_depth[py1:py2, px1:px2]
+                valid_mask = (patch > 0.5) & (patch < 100.0)
+                if np.any(valid_mask):
+                    true_dist = float(np.median(patch[valid_mask]))
+
             if 0.5 < true_dist < 100.0:
                 det["distance_m"] = round(true_dist, 2)
                 if true_dist <= 15.0:

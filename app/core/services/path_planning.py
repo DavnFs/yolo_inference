@@ -233,32 +233,43 @@ def compute_path(
             "road_coverage_ratio": 0.0,
         }
 
-    # --- Center-Lane Bias vs Overtaking Maneuver ---
-    # Full ego-lane corridor: from row 50 down to just above hood zone
-    ego_corridor = grid[50:BEV_HEIGHT - 40, ego_left:ego_right]
-    ego_lane_blocked = np.any(ego_corridor > 200)
+    # --- Adaptive Cruise Control & Overtaking ---
+    # Scan ego lane to find the CLOSEST obstacle. Distant obstacles get a
+    # lane-keeping goal well behind them; only dangerously close obstacles
+    # (<= 20m) trigger an overtaking maneuver.
+    ego_lane_slice = grid[15:BEV_HEIGHT - 40, ego_left:ego_right]
+    blocked_rows = np.where(np.any(ego_lane_slice > 200, axis=1))[0]
 
-    if not ego_lane_blocked:
-        # Lane perfectly clear — drive straight ahead
-        goal_candidates = [(center_x, 15)]
+    if len(blocked_rows) > 0:
+        closest_obs_y = 15 + blocked_rows[-1]
+        dist_m = ((BEV_HEIGHT - 40) - closest_obs_y) / PIXELS_PER_METER
     else:
-        # Obstacle in ego-lane — check adjacent lanes before choosing direction
+        closest_obs_y = 15
+        dist_m = 999.0
+
+    if dist_m > 20.0:
+        # Obstacle is far — stay in lane, place goal behind it
+        goal_candidates = [
+            (center_x, min(BEV_HEIGHT - 50, closest_obs_y + 24))
+        ]
+    else:
+        # Dangerously close — try to overtake via adjacent lanes
+        # Examine the adjacent lanes ONLY from the obstacle's row down to the hood
+        adj_check_rows = slice(closest_obs_y, BEV_HEIGHT - 40)
         left_lane_blocked = np.any(
-            grid[50:BEV_HEIGHT - 40, max(0, ego_left - 30):ego_left] > 200
+            grid[adj_check_rows, max(0, ego_left - 30):ego_left] > 200
         )
         right_lane_blocked = np.any(
-            grid[50:BEV_HEIGHT - 40, ego_right:min(BEV_WIDTH, ego_right + 30)] > 200
+            grid[adj_check_rows, ego_right:min(BEV_WIDTH, ego_right + 30)] > 200
         )
-        goal_candidates = []
+
         if not right_lane_blocked:
-            goal_candidates.append((center_x + 28, 15))
-        if not left_lane_blocked:
-            goal_candidates.append((center_x - 28, 15))
-        valid_goals = [g for g in goal_candidates if is_valid_node(g)]
-        if not valid_goals:
-            goal_candidates = [(center_x, 15)]
+            goal_candidates = [(center_x + 28, max(15, closest_obs_y - 15))]
+        elif not left_lane_blocked:
+            goal_candidates = [(center_x - 28, max(15, closest_obs_y - 15))]
         else:
-            goal_candidates = valid_goals
+            # Both adjacent lanes blocked — fall back to stopping behind obstacle
+            goal_candidates = [(center_x, closest_obs_y + 24)]
 
     t0 = time.perf_counter()
     path = []
