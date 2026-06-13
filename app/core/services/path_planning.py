@@ -64,7 +64,10 @@ def build_occupancy_grid(
         x_bev = int(BEV_WIDTH // 2 + X_meters * PIXELS_PER_METER)
         y_bev = int(BEV_HEIGHT - dist * PIXELS_PER_METER)
 
-        obstacle_w = max(6, int(((bbox[2] - bbox[0]) / fx) * dist * PIXELS_PER_METER))
+        # Enforce minimum physical vehicle width (1.8m) for mirrors & bbox inaccuracies
+        bbox_w_meters = ((bbox[2] - bbox[0]) / fx) * dist
+        bbox_w_meters = max(1.8, bbox_w_meters)
+        obstacle_w = int(bbox_w_meters * PIXELS_PER_METER)
         obstacle_h = max(8, int(dist * 0.2 * PIXELS_PER_METER))
 
         x1, y1, x2, y2 = _clip_rect(
@@ -75,44 +78,18 @@ def build_occupancy_grid(
         )
         cv2.rectangle(grid, (x1, y1), (x2, y2), 255, -1)
 
-    # 2. PEMETAAN CONTOUR JALAN BERBASIS FULL VECTORIZED DEPTH (Anti Blindspot)
-    h, w = image_shape
-    road_mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillPoly(road_mask, [road_polygon_abs.astype(np.int32)], 255)
-
-    # Ambil index piksel yang memenuhi syarat kontur dekat secara instan via NumPy
-    # Filter: hanya 2.5m–15m untuk menghilangkan ego-hood dan noise jauh
-    depth_mask = (metric_depth_map >= 2.5) & (metric_depth_map < 15.0) & (road_mask > 0)
-    depth_indices = np.where(depth_mask)
-
-    if len(depth_indices[0]) > 0:
-        py_nodes = depth_indices[0]
-        px_nodes = depth_indices[1]
-        z_nodes = metric_depth_map[py_nodes, px_nodes]
-
-        # Operasi vektor matematika NumPy langsung untuk seluruh piksel sekaligus
-        x_meters_nodes = ((px_nodes - cx) * z_nodes) / fx
-        x_bev_nodes = (BEV_WIDTH // 2 + x_meters_nodes * PIXELS_PER_METER).astype(
-            np.int32
-        )
-        y_bev_nodes = (BEV_HEIGHT - z_nodes * PIXELS_PER_METER).astype(np.int32)
-
-        # Filter indeks agar tidak keluar dari batas dimensi grid BEV
-        valid_mask = (
-            (x_bev_nodes >= 0)
-            & (x_bev_nodes < BEV_WIDTH)
-            & (y_bev_nodes >= 0)
-            & (y_bev_nodes < BEV_HEIGHT)
-        )
-
-        grid[y_bev_nodes[valid_mask], x_bev_nodes[valid_mask]] = 255
-
-    # Bersihkan baris paling bawah BEV (ego-hood noise zone)
-    grid[BEV_HEIGHT - 30:, :] = 0
-
-    # 3. INFLATION LAYER (Penebalan rintangan demi keselamatan fisik robot)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    # 2. C-SPACE INFLATION (Minkowski Sum — ego half-width + safety margin)
+    #    Ego width 1.8m → radius 0.9m + 0.3m margin = 1.2m total inflation
+    inflation_radius_px = int(1.2 * PIXELS_PER_METER)  # ~9 pixels
+    kernel_size = inflation_radius_px * 2 + 1           # 19
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (kernel_size, kernel_size)
+    )
     grid = cv2.dilate(grid, kernel, iterations=1)
+
+    # Bersihkan baris paling bawah BEV (ego-hood noise zone — AFTER inflation
+    # to prevent the large kernel from bleeding into the vehicle baseline)
+    grid[BEV_HEIGHT - 40:, :] = 0
 
     # 4. BEV ROAD MASK CONSTRAINT — virtual walls outside driveable corridor
     #    Warp the camera-frame road polygon into BEV space using the cached
@@ -252,17 +229,23 @@ def compute_path(
         return best_alt  # None jika tidak ada alternatif
 
     center_x = BEV_WIDTH // 2
+
+    # --- Ego-Vehicle Dimensions (physical car width → BEV pixels) ---
+    ego_width_m = 1.8
+    ego_w_px = int((ego_width_m * PIXELS_PER_METER) / 2)  # half-width in pixels
+    ego_left = max(0, center_x - ego_w_px)
+    ego_right = min(BEV_WIDTH, center_x + ego_w_px)
+
     starts = [
         (center_x, BEV_HEIGHT - 10),
         (center_x - 20, BEV_HEIGHT - 10),
         (center_x + 20, BEV_HEIGHT - 10),
     ]
 
-    # --- Emergency Stop: immediate front fully blocked ---
-    front_zone = grid[BEV_HEIGHT - 60:BEV_HEIGHT, :]
-    front_blocked = np.all(front_zone > 200)
-
-    if front_blocked:
+    # --- Emergency Stop: front zone just ahead of cleared hood ---
+    #    Slice from BEV_HEIGHT-60 to BEV_HEIGHT-40 (above the hood clear zone)
+    front_zone = grid[BEV_HEIGHT - 60:BEV_HEIGHT - 40, ego_left:ego_right]
+    if np.all(front_zone > 200):
         stop_point = (center_x, BEV_HEIGHT - 10)
         return {
             "waypoints": [stop_point],
@@ -274,20 +257,16 @@ def compute_path(
             "road_coverage_ratio": 0.0,
         }
 
-    # --- Center-Lane Bias: default straight-ahead goal ---
-    straight_goal = (center_x, 15)
-
-    # Ego-lane corridor check: columns center_x±15, rows 50..BEV_HEIGHT
-    ego_left = max(0, center_x - 15)
-    ego_right = min(BEV_WIDTH, center_x + 15)
-    ego_corridor = grid[50:BEV_HEIGHT, ego_left:ego_right]
+    # --- Center-Lane Bias vs Overtaking Maneuver ---
+    # Full ego-lane corridor: from row 50 down to just above hood zone
+    ego_corridor = grid[50:BEV_HEIGHT - 40, ego_left:ego_right]
     ego_lane_blocked = np.any(ego_corridor > 200)
 
     if not ego_lane_blocked:
-        # Road ahead is clear — drive straight
-        goal_candidates = [straight_goal]
+        # Lane perfectly clear — drive straight ahead
+        goal_candidates = [(center_x, 15)]
     else:
-        # Ego-lane blocked — try alternate lane midpoints at horizon
+        # Obstacle in ego-lane — scan horizon for alternate overtaking lanes
         goal_candidates = []
         for y_h in range(10, 31):
             row = grid[y_h, :]
@@ -296,7 +275,7 @@ def compute_path(
                 mid = int(valid_cols[len(valid_cols) // 2])
                 goal_candidates.append((mid, y_h))
         if not goal_candidates:
-            goal_candidates = [straight_goal]
+            goal_candidates = [(center_x, 15)]
 
     t0 = time.perf_counter()
     path = []
