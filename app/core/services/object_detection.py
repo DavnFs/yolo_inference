@@ -723,7 +723,8 @@ def draw_main_visualization(
     frame: np.ndarray,
     analysis_results: Dict,
     abs_polygon_points: np.ndarray,
-    show_uncertainty: bool = False
+    show_uncertainty: bool = False,
+    path_data=None
 ) -> np.ndarray:
     frame_h, frame_w = frame.shape[:2]
     cv2.polylines(frame, [np.int32(abs_polygon_points)], isClosed=True, color=(0, 255, 255), thickness=2)
@@ -759,4 +760,28 @@ def draw_main_visualization(
         if hazard_level != 'out_of_roi' and det.get("distance_m") is not None:
             dist_text = f"{det['distance_m']}m"
             cv2.putText(frame, dist_text, (x1, max(th + 2, label_top - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    if path_data and path_data.get("path_found"):
+        projected_points = []
+        for bev_x, bev_y in path_data.get("waypoints", []):
+            x_norm = ((bev_x - BEV_WIDTH / 2) / (BEV_WIDTH * 0.8)) + 0.5
+            img_x = int(x_norm * frame_w)
+            dist_m = (BEV_HEIGHT - bev_y) / PIXELS_PER_METER
+            img_y = int(frame_h - dist_m * (frame_h / 15.0))
+            if 0 <= img_x < frame_w and 0 <= img_y < frame_h:
+                projected_points.append((img_x, img_y))
+
+        if len(projected_points) >= 2:
+            cv2.polylines(
+                frame,
+                [np.array(projected_points, dtype=np.int32)],
+                isClosed=False,
+                color=(0, 255, 255),
+                thickness=3,
+            )
+        for point in projected_points:
+            cv2.circle(frame, point, 4, (0, 200, 255), -1)
+        if projected_points:
+            label_x, label_y = projected_points[0]
+            cv2.putText(frame, "PATH", (label_x, max(15, label_y - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
     return frame

@@ -470,9 +470,11 @@ class DashboardGUI:
         results["detections"] = analyzed_dets
 
         show_unc = use_mc and self.show_uncertainty_var.get()
+        path_data = results.get("path_planning")
         processed_frame = (
             draw_main_visualization(frame_bgr.copy(), results, abs_poly,
-                                    show_uncertainty=show_unc)
+                                    show_uncertainty=show_unc,
+                                    path_data=path_data)
             if self.show_polygon_enabled else frame_bgr
         )
         self._schedule_canvas_update(processed_frame)
@@ -577,14 +579,19 @@ class DashboardGUI:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
 
         if path_data and path_data.get("path_found"):
-            waypoints = path_data["waypoints"]
-            for i in range(len(waypoints) - 1):
-                pt1 = (int(waypoints[i][0]), int(waypoints[i][1]))
-                pt2 = (int(waypoints[i + 1][0]), int(waypoints[i + 1][1]))
+            scale_x = canvas_w / BEV_WIDTH
+            scale_y = canvas_h / BEV_HEIGHT
+            scaled_waypoints = [
+                (int(wx * scale_x), int(wy * scale_y))
+                for wx, wy in path_data["waypoints"]
+            ]
+            for i in range(len(scaled_waypoints) - 1):
+                pt1 = (int(scaled_waypoints[i][0]), int(scaled_waypoints[i][1]))
+                pt2 = (int(scaled_waypoints[i + 1][0]), int(scaled_waypoints[i + 1][1]))
                 cv2.line(bev_img, pt1, pt2, (0, 200, 255), 2)
-            if waypoints:
-                start_pt = (int(waypoints[0][0]), int(waypoints[0][1]))
-                goal_pt = (int(waypoints[-1][0]), int(waypoints[-1][1]))
+            if scaled_waypoints:
+                start_pt = (int(scaled_waypoints[0][0]), int(scaled_waypoints[0][1]))
+                goal_pt = (int(scaled_waypoints[-1][0]), int(scaled_waypoints[-1][1]))
                 cv2.circle(bev_img, start_pt, 5, (255, 255, 0), -1)
                 cv2.circle(bev_img, goal_pt, 5, (0, 255, 0), -1)
         elif path_data and not path_data.get("path_found"):
