@@ -645,7 +645,7 @@ class DashboardGUI:
             return
 
         from app.core.services.object_detection import (
-            BEV_WIDTH, BEV_HEIGHT, PIXELS_PER_METER, HAZARD_COLORS
+            BEV_WIDTH, BEV_HEIGHT, PIXELS_PER_METER, HAZARD_COLORS, STEREO_FX
         )
 
         canvas_w = self.bev_canvas.winfo_width() or BEV_WIDTH
@@ -665,8 +665,9 @@ class DashboardGUI:
                       (0, 180, 180), -1)
 
         # Pinhole camera intrinsics (must match path_planning.py)
-        fx = 721.53
         orig_w = self._frame_img_w or 640
+        scale_factor = orig_w / 1242.0
+        fx = STEREO_FX * scale_factor
         cx_img = orig_w // 2
 
         for det in dets:
