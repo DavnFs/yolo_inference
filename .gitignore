@@ -1,0 +1,39 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+# Agentic
+.agents
+.commandcode
+plan.md
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+.DS_Store
+
+# Generated outputs and local assets
+output/
+assets/
+stereo_dataset/
+tmp_depth*/
+
+# Local models and large ML artifacts
+app/models/
+app/trt_cache/
+*.onnx
+*.onnx.data
+*.pt
+*.pth
+
+# Claude Code internal files
+.claude/
