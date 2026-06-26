@@ -132,7 +132,11 @@ def get_active_model_name() -> str:
     return CURRENT_MODEL_NAME
 
 
-_GPU_DEVICE_TYPES = {"CUDAExecutionProvider": "cuda", "TensorrtExecutionProvider": "cuda", "DmlExecutionProvider": "dml"}
+_GPU_DEVICE_TYPES = {
+    "CUDAExecutionProvider": "cuda",
+    "TensorrtExecutionProvider": "cuda",
+    "DmlExecutionProvider": "dml",
+}
 
 
 class GPUSession:
@@ -252,7 +256,9 @@ def _build_providers(model_path: str, model_key: str):
     providers = []
     use_gpu = False
 
-    TRT_CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "app", "trt_cache")
+    TRT_CACHE_DIR = os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "app", "trt_cache"
+    )
     os.makedirs(TRT_CACHE_DIR, exist_ok=True)
 
     gpu_providers = [
@@ -276,8 +282,8 @@ def _build_providers(model_path: str, model_key: str):
             "CUDAExecutionProvider",
             {
                 "device_id": 0,
-                "cudnn_conv_algo_search": "HEURISTIC",   # lebih cepat dari EXHAUSTIVE
-                "do_copy_in_default_stream": True,        # hindari stream sync overhead
+                "cudnn_conv_algo_search": "HEURISTIC",  # lebih cepat dari EXHAUSTIVE
+                "do_copy_in_default_stream": True,  # hindari stream sync overhead
             },
         ),
     ]
@@ -313,10 +319,7 @@ def _create_inference_session(
             model_path, sess_options=sess_options, providers=providers
         )
     except Exception:
-        if (
-            providers
-            and isinstance(providers[0], tuple)
-        ):
+        if providers and isinstance(providers[0], tuple):
             ep_name = providers[0][0]
             print(
                 f"[ONNXRuntime] Retrying {ep_name} init with default provider options..."
@@ -340,7 +343,14 @@ def _run_session(
 def _warmup_session(session: Any, model_key: str):
     raw_session = session.session if isinstance(session, GPUSession) else session
     active_providers = raw_session.get_providers()
-    is_gpu = any(ep in active_providers for ep in ("CUDAExecutionProvider", "TensorrtExecutionProvider", "DmlExecutionProvider"))
+    is_gpu = any(
+        ep in active_providers
+        for ep in (
+            "CUDAExecutionProvider",
+            "TensorrtExecutionProvider",
+            "DmlExecutionProvider",
+        )
+    )
     if not is_gpu:
         return
 
@@ -422,8 +432,14 @@ def load_onnx_model_once(model_path: str, model_key: str):
                 raw_session = _create_inference_session(
                     session_model_path, sess_options=sess_options, providers=providers
                 )
-                _gpu_eps = ("CUDAExecutionProvider", "TensorrtExecutionProvider", "DmlExecutionProvider")
-                if use_gpu and any(ep in raw_session.get_providers() for ep in _gpu_eps):
+                _gpu_eps = (
+                    "CUDAExecutionProvider",
+                    "TensorrtExecutionProvider",
+                    "DmlExecutionProvider",
+                )
+                if use_gpu and any(
+                    ep in raw_session.get_providers() for ep in _gpu_eps
+                ):
                     ONNX_SESSIONS[model_key] = GPUSession(raw_session)
                     _warmup_session(ONNX_SESSIONS[model_key], model_key)
                 else:
@@ -673,7 +689,9 @@ def get_yolo_prediction(image_bytes: bytes, model_path: str, labels_path: str) -
 
 
 def _run_path_planning(
-    results: Dict, frame_bgr: np.ndarray, external_depth: np.ndarray,
+    results: Dict,
+    frame_bgr: np.ndarray,
+    external_depth: np.ndarray,
     camera_intrinsics: dict = None,
 ) -> Dict:
     try:
@@ -705,7 +723,7 @@ def _run_path_planning(
 
             if np.any(valid_mask):
                 # Kunci permukaan bodi mobil, abaikan background
-                true_dist = float(np.percentile(patch[valid_mask], 20))
+                true_dist = float(np.percentile(patch[valid_mask], 50))
             else:
                 true_dist = 0.0
 
@@ -720,8 +738,11 @@ def _run_path_planning(
                     det["hazard_level"] = "safe"
 
         results["path_planning"] = compute_path(
-            results["detections"], external_depth, (h, w), abs_poly,
-            camera_intrinsics=camera_intrinsics
+            results["detections"],
+            external_depth,
+            (h, w),
+            abs_poly,
+            camera_intrinsics=camera_intrinsics,
         )
     except Exception as e:
         # Menangkap error agar GUI tidak blank
@@ -769,8 +790,12 @@ def get_combined_prediction_from_frame(
                 mc_result["weather_prediction"] = "N/A"
                 mc_result["metrics"] = {"processing_latency_ms": 0}
                 if enable_path_planning and external_depth is not None:
-                    _run_path_planning(mc_result, frame_bgr, external_depth,
-                                       camera_intrinsics=camera_intrinsics)
+                    _run_path_planning(
+                        mc_result,
+                        frame_bgr,
+                        external_depth,
+                        camera_intrinsics=camera_intrinsics,
+                    )
                 return mc_result
         except Exception as e:
             print(f"[MC Dropout] Falling back to ONNX inference: {e}")
@@ -805,8 +830,9 @@ def get_combined_prediction_from_frame(
         "processing_latency_ms": round((end_time - start_time) * 1000, 2)
     }
     if enable_path_planning and external_depth is not None:
-        _run_path_planning(results, frame_bgr, external_depth,
-                           camera_intrinsics=camera_intrinsics)
+        _run_path_planning(
+            results, frame_bgr, external_depth, camera_intrinsics=camera_intrinsics
+        )
     return results
 
 
@@ -919,6 +945,7 @@ def draw_main_visualization(
     show_uncertainty: bool = False,
     path_data=None,
     frame_shape: tuple = None,
+    camera_intrinsics: dict = None,
 ) -> np.ndarray:
     frame_h, frame_w = frame.shape[:2]
     cv2.polylines(
@@ -986,14 +1013,36 @@ def draw_main_visualization(
     if path_data and path_data.get("path_found"):
         waypoints = path_data.get("waypoints", [])
         if len(waypoints) >= 2 and frame_shape is not None:
-            # Use inverse perspective matrix to map BEV waypoints back to camera frame
-            _, _, M_inv = _get_frame_geometry(frame_shape)
-            bev_pts = np.array(waypoints, dtype=np.float32).reshape(-1, 1, 2)
-            camera_pts = cv2.perspectiveTransform(bev_pts, M_inv).reshape(-1, 2)
+            if camera_intrinsics is not None:
+                fx = camera_intrinsics["fx"]
+                fy = camera_intrinsics["fy"]
+                cx = camera_intrinsics["cx"]
+                cy = camera_intrinsics["cy"]
+            else:
+                from app.core.config import get_scaled_intrinsics
+                scaled = get_scaled_intrinsics(frame_w)
+                fx = scaled["fx"]
+                fy = scaled["fy"]
+                cx = scaled["cx"]
+                cy = scaled["cy"]
+
+            # Use dynamic camera height from intrinsics, fallback to 1.65m for KITTI
+            camera_height_m = camera_intrinsics.get("camera_height_m", 1.65) if camera_intrinsics else 1.65
 
             projected_points = []
-            for pt in camera_pts:
-                ix, iy = int(round(pt[0])), int(round(pt[1]))
+            for wx, wy in waypoints:
+                # Convert grid to metrics (X, Z)
+                z_m = (BEV_HEIGHT - wy) / PIXELS_PER_METER
+                x_m = (wx - BEV_WIDTH / 2.0) / PIXELS_PER_METER
+
+                if z_m <= 0.1:
+                    continue
+
+                # Project 3D coordinate (x_m, camera_height_m, z_m) to 2D image plane (u, v)
+                u = (x_m * fx) / z_m + cx
+                v = (camera_height_m * fy) / z_m + cy
+
+                ix, iy = int(round(u)), int(round(v))
                 if 0 <= ix < frame_w and 0 <= iy < frame_h:
                     projected_points.append((ix, iy))
 

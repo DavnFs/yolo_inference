@@ -117,8 +117,8 @@ def backproject_detections(
         if valid_pixels.size < 5:
             continue
 
-        # Percentile 20 lebih konservatif — mendekati permukaan bodi kendaraan
-        z = float(np.percentile(valid_pixels, 20))
+        # Use 50th percentile (median) for robust depth of the object body
+        z = float(np.percentile(valid_pixels, 50))
 
         u_centers.append((x1 + x2) * 0.5)
         v_centers.append((y1 + y2) * 0.5)
@@ -402,10 +402,13 @@ def intrinsics_from_frame_width(orig_w: int, stereo_fx: float = 721.53,
                                  native_w: int = 1242) -> Intrinsics:
     """
     Fallback intrinsics jika CameraInfo belum tersedia (misal mode StereoSimLoader).
-    Approximasi: cx = orig_w / 2, cy = orig_h / 2 (tidak dipakai untuk X BEV).
+    Menggunakan get_scaled_intrinsics dari config global untuk konsistensi geometri.
     """
-    scale = orig_w / native_w
-    fx = stereo_fx * scale
-    cx = orig_w / 2.0
-    cy = cx * (375.0 / 1242.0)  # KITTI native aspect ratio approximation
-    return Intrinsics(fx=fx, fy=fx, cx=cx, cy=cy)
+    from app.core.config import get_scaled_intrinsics
+    scaled = get_scaled_intrinsics(orig_w)
+    return Intrinsics(
+        fx=scaled['fx'],
+        fy=scaled['fy'],
+        cx=scaled['cx'],
+        cy=scaled['cy']
+    )

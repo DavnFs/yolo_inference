@@ -6,6 +6,11 @@ __pycache__/
 .agents
 .commandcode
 plan.md
+/tmp_kitti_setup
+
+summary.md
+
+test_grid.png
 
 # Virtual environments
 .venv/

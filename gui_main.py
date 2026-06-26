@@ -30,26 +30,26 @@ from app.core.services.bev_projection import (
 
 
 class StereoSimLoader:
-    """Ingest stereo dataset pairs (left RGB + 16-bit disparity) and produce metric depth maps."""
+    """Ingest stereo dataset pairs (left RGB + 32-bit float metric depth .npy) and load depth maps."""
 
-    def __init__(self, root_dir: str, fx: float = 721.53, baseline: float = 0.54):
+    def __init__(self, root_dir: str):
         self.root_dir = root_dir
-        self.fx = fx
-        self.baseline = baseline
         self.left_dir = os.path.join(root_dir, "left_images")
-        self.disp_dir = os.path.join(root_dir, "disparity")
+        self.disp_dir = os.path.join(root_dir, "depth_npy")
         self._frame_list = []
         if os.path.isdir(self.left_dir) and os.path.isdir(self.disp_dir):
             left_files = sorted(f for f in os.listdir(self.left_dir) if f.lower().endswith(".png"))
             for fname in left_files:
-                if os.path.exists(os.path.join(self.disp_dir, fname)):
+                base_name = os.path.splitext(fname)[0]
+                npy_name = f"{base_name}.npy"
+                if os.path.exists(os.path.join(self.disp_dir, npy_name)):
                     self._frame_list.append(fname)
 
     def is_opened(self) -> bool:
         return len(self._frame_list) > 0
 
     def read_frame(self, index: int):
-        """Read the RGB frame and compute metric depth for the given sequential index.
+        """Read the RGB frame and load metric depth for the given sequential index.
 
         Returns:
             (success: bool, frame_bgr: np.ndarray | None, depth_map_m: np.ndarray | None)
@@ -59,24 +59,19 @@ class StereoSimLoader:
 
         fname = self._frame_list[index]
         left_path = os.path.join(self.left_dir, fname)
-        disp_path = os.path.join(self.disp_dir, fname)
+        base_name = os.path.splitext(fname)[0]
+        disp_path = os.path.join(self.disp_dir, f"{base_name}.npy")
 
         frame_bgr = cv2.imread(left_path, cv2.IMREAD_COLOR)
         if frame_bgr is None:
             return False, None, None
 
-        # 16-bit disparity stored as PNG (DrivingStereo convention)
-        disparity_raw = cv2.imread(disp_path, cv2.IMREAD_UNCHANGED)
-        if disparity_raw is None:
+        try:
+            # Load pre-calculated 32-bit float metric depth map (ZED 2i simulation)
+            depth_m = np.load(disp_path).astype(np.float32)
+        except Exception as e:
+            print(f"[StereoSimLoader Error] Failed to load depth map: {e}")
             return False, None, None
-
-        disparity = disparity_raw.astype(np.float32) / 256.0
-
-        # Guard against division-by-zero / negative disparity
-        disparity = np.where(disparity <= 0.1, 0.1, disparity)
-
-        # Depth = (baseline * fx) / disparity   [meters]
-        depth_m = (self.baseline * self.fx) / disparity
 
         # Clip to operational range
         depth_m = np.clip(depth_m, 0.5, 40.0)
@@ -748,7 +743,8 @@ class DashboardGUI:
             draw_main_visualization(frame_bgr.copy(), results, abs_poly,
                                     show_uncertainty=show_unc,
                                     path_data=path_data,
-                                    frame_shape=frame_bgr.shape[:2])
+                                    frame_shape=frame_bgr.shape[:2],
+                                    camera_intrinsics=self._latest_calib)
             if self.show_polygon_enabled else frame_bgr
         )
         self._schedule_canvas_update(processed_frame)
@@ -926,7 +922,10 @@ class DashboardGUI:
                 cv2.circle(ogm_rgb, (int(waypoints[-1][0]), int(waypoints[-1][1])), 4, (0, 255, 0),   -1)
 
         h, w = ogm_rgb.shape[:2]
-        cv2.rectangle(ogm_rgb, (w // 2 - 6, h - 15), (w // 2 + 6, h - 5), (0, 180, 180), -1)
+        # Draw ego vehicle as a vertical rectangle (narrow lateral, longer forward)
+        ego_cx = w // 2
+        ego_w, ego_h = 8, 18  # ~1m wide, ~2.2m long in BEV scale
+        cv2.rectangle(ogm_rgb, (ego_cx - ego_w // 2, h - ego_h - 2), (ego_cx + ego_w // 2, h - 2), (0, 180, 180), -1)
 
         self._latest_ogm_frame = ogm_rgb
         if self._active_view == "ogm":
