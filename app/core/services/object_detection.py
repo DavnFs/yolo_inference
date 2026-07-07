@@ -19,7 +19,7 @@ GEOMETRY_CACHE = {}
 
 # Konstanta Geometri
 ROAD_POLYGON_POINTS_RELATIVE = np.float32(
-    [(0.0, 1.0), (0.4, 0.55), (0.6, 0.55), (1.0, 1.0)]
+    [(0.15, 1.0), (0.38, 0.55), (0.62, 0.55), (0.85, 1.0)]
 )
 BEV_WIDTH, BEV_HEIGHT = 200, 400
 BEV_DESTINATION_POINTS = np.float32(
@@ -743,6 +743,7 @@ def _run_path_planning(
             (h, w),
             abs_poly,
             camera_intrinsics=camera_intrinsics,
+            frame_bgr=frame_bgr,
         )
     except Exception as e:
         # Menangkap error agar GUI tidak blank
@@ -1020,6 +1021,7 @@ def draw_main_visualization(
                 cy = camera_intrinsics["cy"]
             else:
                 from app.core.config import get_scaled_intrinsics
+
                 scaled = get_scaled_intrinsics(frame_w)
                 fx = scaled["fx"]
                 fy = scaled["fy"]
@@ -1027,7 +1029,11 @@ def draw_main_visualization(
                 cy = scaled["cy"]
 
             # Use dynamic camera height from intrinsics, fallback to 1.65m for KITTI
-            camera_height_m = camera_intrinsics.get("camera_height_m", 1.65) if camera_intrinsics else 1.65
+            camera_height_m = (
+                camera_intrinsics.get("camera_height_m", 1.65)
+                if camera_intrinsics
+                else 1.65
+            )
 
             projected_points = []
             for wx, wy in waypoints:

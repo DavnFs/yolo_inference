@@ -5,12 +5,12 @@ from typing import Dict, List, Tuple
 import cv2
 import numpy as np
 
+from app.core.config import get_scaled_intrinsics
 from app.core.services.object_detection import (
     BEV_HEIGHT,
     BEV_WIDTH,
     PIXELS_PER_METER,
 )
-from app.core.config import get_scaled_intrinsics
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -19,7 +19,9 @@ _DRIVINGSTEREO_NATIVE_W = 1242
 _EGO_WIDTH_M = 1.8
 _EGO_LENGTH_M = 2.5
 _OBS_MIN_WIDTH_PX = 8
-_INFLATION_RADIUS_M = (_EGO_WIDTH_M / 2.0) + 0.5  # Inflasi berdasarkan lebar mobil + margin
+_INFLATION_RADIUS_M = (
+    _EGO_WIDTH_M / 2.0
+) + 0.5  # Inflasi berdasarkan lebar mobil + margin
 _HOOD_CLEAR_ROWS = 40
 _EMERGENCY_STOP_ROWS = 40
 _EMERGENCY_STOP_THRESHOLD = 0.7
@@ -30,6 +32,12 @@ _OVERTAKE_CLEARANCE_PX = 40
 _ACC_BACKSTOP_PX = 80
 _TURN_PENALTY = 1.5
 _GOAL_SNAP_RADIUS = 5
+# Margin aman fisik antara bodi mobil ego dan objek (15 cm)
+_MARGIN_SAFE_M = 0.15
+
+# Configuration Space (Minkowski Sum): Dimensi Ego + Margin
+_DELTA_W_M = _EGO_WIDTH_M + (2 * _MARGIN_SAFE_M)  # 1.8 + 0.3 = 2.1 m
+_DELTA_H_M = _EGO_LENGTH_M + (2 * _MARGIN_SAFE_M)  # 2.5 + 0.3 = 2.8 m
 
 
 def _clip_rect(x1, y1, x2, y2):
@@ -57,12 +65,43 @@ def _snap_goal(grid: np.ndarray, goal: Tuple[int, int]) -> Tuple[int, int]:
     return best
 
 
+def _get_road_color_mask(
+    frame_bgr: np.ndarray, road_start_row: int, depth_h: int, depth_w: int
+) -> np.ndarray:
+    """Reject green/vegetation-colored pixels from the drivable mask.
+
+    Depth alone can't tell asphalt from a flat grass verge, both satisfy
+    the ground-plane equation. This adds an independent color cue so
+    flood fill can't walk from the road onto the lawn just because
+    they're coplanar.
+
+    Returns a boolean mask, True where the pixel is allowed to remain
+    drivable (i.e. NOT classified as vegetation).
+    """
+    if frame_bgr.shape[0] != depth_h or frame_bgr.shape[1] != depth_w:
+        frame_bgr = cv2.resize(
+            frame_bgr, (depth_w, depth_h), interpolation=cv2.INTER_LINEAR
+        )
+
+    region_bgr = frame_bgr[road_start_row:depth_h, :]
+    hsv = cv2.cvtColor(region_bgr, cv2.COLOR_BGR2HSV)
+    h_ch, s_ch = hsv[:, :, 0], hsv[:, :, 1]
+
+    # OpenCV hue range is 0-179. Green/vegetation sits roughly 35-95.
+    # Saturation gate avoids flagging desaturated/shadowed grass as road
+    # by accident, but also means this will miss dead or dry grass,
+    # see caveat below.
+    is_vegetation = (h_ch >= 35) & (h_ch <= 95) & (s_ch >= 40)
+    return ~is_vegetation
+
+
 def estimate_driveable_mask(
     metric_depth_map: np.ndarray,
     image_shape: tuple,
     camera_intrinsics: dict = None,
     camera_height_m: float = 1.65,
     depth_tolerance_ratio: float = 0.40,
+    frame_bgr: np.ndarray = None,
 ) -> np.ndarray:
     """Estimate driveable area from depth map using ground plane model.
 
@@ -94,11 +133,11 @@ def estimate_driveable_mask(
     if camera_intrinsics is None:
         camera_intrinsics = get_scaled_intrinsics(depth_w, depth_h)
 
-    fx = camera_intrinsics['fx']
-    fy = camera_intrinsics['fy']
-    cx_cam = camera_intrinsics['cx']
-    cy_cam = camera_intrinsics['cy']
-    camera_height_m = camera_intrinsics.get('camera_height_m', camera_height_m)
+    fx = camera_intrinsics["fx"]
+    fy = camera_intrinsics["fy"]
+    cx_cam = camera_intrinsics["cx"]
+    cy_cam = camera_intrinsics["cy"]
+    camera_height_m = camera_intrinsics.get("camera_height_m", camera_height_m)
 
     # Only analyse bottom 55 % of image (where road typically appears)
     road_start_row = int(depth_h * 0.45)
@@ -116,8 +155,14 @@ def estimate_driveable_mask(
     valid_mask = actual_depth > 0.5
     depth_error = np.abs(actual_depth - expected_z_map)
     # Tighten tolerance to prevent classifying sidewalks/walls as road
-    tolerance = expected_z_map * depth_tolerance_ratio + 0.5 
+    tolerance = expected_z_map * depth_tolerance_ratio + 0.5
     ground_mask_road = valid_mask & (depth_error < tolerance)
+
+    # NEW: reject vegetation-colored pixels even if they passed the
+    # flatness check
+    if frame_bgr is not None:
+        color_mask = _get_road_color_mask(frame_bgr, road_start_row, depth_h, depth_w)
+        ground_mask_road = ground_mask_road & color_mask
 
     ground_mask = np.zeros((depth_h, depth_w), dtype=np.uint8)
     ground_mask[road_start_row:depth_h] = ground_mask_road.astype(np.uint8) * 255
@@ -154,8 +199,7 @@ def estimate_driveable_mask(
     y_grid = (BEV_HEIGHT - z_vals * PIXELS_PER_METER).astype(np.int32)
 
     in_bounds = (
-        (x_grid >= 0) & (x_grid < BEV_WIDTH)
-        & (y_grid >= 0) & (y_grid < BEV_HEIGHT)
+        (x_grid >= 0) & (x_grid < BEV_WIDTH) & (y_grid >= 0) & (y_grid < BEV_HEIGHT)
     )
     bev_mask[y_grid[in_bounds], x_grid[in_bounds]] = 255
 
@@ -163,11 +207,41 @@ def estimate_driveable_mask(
     kernel_fill = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     bev_mask = cv2.dilate(bev_mask, kernel_fill, iterations=2)
     bev_mask = cv2.morphologyEx(
-        bev_mask, cv2.MORPH_CLOSE,
+        bev_mask,
+        cv2.MORPH_CLOSE,
         cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)),
     )
 
     return bev_mask
+
+
+def get_connected_drivable_mask(
+    bev_ground_mask: np.ndarray, ego_x: int, ego_y: int
+) -> np.ndarray:
+    """
+    Menggunakan Flood Fill untuk memastikan hanya area yang terhubung secara fisik
+    dengan posisi Ego Vehicle yang dianggap sebagai jalan (drivable area).
+    Ini mencegah mobil menganggap trotoar atau area datar yang terputus sebagai jalan.
+    """
+    # Pastikan mask biner (0 dan 255)
+    binary_mask = np.zeros_like(bev_ground_mask)
+    binary_mask[bev_ground_mask > 0] = 255
+
+    # Tutup celah kecil (noise pada depth map) agar jalan tidak terputus secara tidak sengaja
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel)
+
+    # Flood fill dari posisi ego
+    flood_mask = np.zeros(
+        (binary_mask.shape[0] + 2, binary_mask.shape[1] + 2), np.uint8
+    )
+    # Kita gunakan nilai 128 untuk menandai area yang terhubung
+    cv2.floodFill(binary_mask, flood_mask, (ego_x, ego_y), 128)
+
+    # Hanya area yang terhubung (128) yang dianggap driveable
+    connected_mask = np.zeros_like(bev_ground_mask)
+    connected_mask[binary_mask == 128] = 255
+    return connected_mask
 
 
 def build_occupancy_grid(
@@ -176,6 +250,7 @@ def build_occupancy_grid(
     image_shape: tuple,
     road_polygon_abs: np.ndarray,
     camera_intrinsics: dict = None,
+    frame_bgr: np.ndarray = None,
 ) -> np.ndarray:
     grid = np.zeros((BEV_HEIGHT, BEV_WIDTH), dtype=np.uint8)
 
@@ -184,13 +259,13 @@ def build_occupancy_grid(
     if camera_intrinsics is None:
         camera_intrinsics = get_scaled_intrinsics(orig_w, orig_h)
 
-    fx = camera_intrinsics['fx']
-    fy = camera_intrinsics['fy']
-    cx = camera_intrinsics['cx']
-    cy = camera_intrinsics['cy']
+    fx = camera_intrinsics["fx"]
+    fy = camera_intrinsics["fy"]
+    cx = camera_intrinsics["cx"]
+    cy = camera_intrinsics["cy"]
 
-    # 1. Project the road polygon to BEV grid and block off-road areas
-    camera_height_m = camera_intrinsics.get('camera_height_m', 1.65)
+    # 1. Project the road polygon to BEV grid (Area Jalan / Drivable)
+    camera_height_m = camera_intrinsics.get("camera_height_m", 1.65)
     bev_poly_pts = []
     for pt in road_polygon_abs:
         u, v = pt[0], pt[1]
@@ -201,32 +276,32 @@ def build_occupancy_grid(
         x_grid = int(BEV_WIDTH / 2.0 + x_m * PIXELS_PER_METER)
         y_grid = int(BEV_HEIGHT - z_m * PIXELS_PER_METER)
 
-        # Allow coordinates outside grid bounds for accurate slope calculation during extrapolation
         x_grid = max(-100, min(BEV_WIDTH + 100, x_grid))
         y_grid = max(-100, min(BEV_HEIGHT + 100, y_grid))
         bev_poly_pts.append([x_grid, y_grid])
 
-    # Extrapolate road polygon to the very top (y=0) and bottom (y=BEV_HEIGHT) of the grid
     if len(bev_poly_pts) == 4:
         pt_bl = bev_poly_pts[0]
         pt_tl = bev_poly_pts[1]
         pt_tr = bev_poly_pts[2]
         pt_br = bev_poly_pts[3]
 
-        # Left boundary extrapolation (from bottom-left to top-left)
         dy_l = pt_tl[1] - pt_bl[1]
         if abs(dy_l) > 1e-3:
             x_new_tl = int(round(pt_tl[0] - pt_tl[1] * (pt_tl[0] - pt_bl[0]) / dy_l))
-            x_new_bl = int(round(pt_bl[0] + (BEV_HEIGHT - pt_bl[1]) * (pt_tl[0] - pt_bl[0]) / dy_l))
+            x_new_bl = int(
+                round(pt_bl[0] + (BEV_HEIGHT - pt_bl[1]) * (pt_tl[0] - pt_bl[0]) / dy_l)
+            )
         else:
             x_new_tl = pt_tl[0]
             x_new_bl = pt_bl[0]
 
-        # Right boundary extrapolation (from bottom-right to top-right)
         dy_r = pt_tr[1] - pt_br[1]
         if abs(dy_r) > 1e-3:
             x_new_tr = int(round(pt_tr[0] - pt_tr[1] * (pt_tr[0] - pt_br[0]) / dy_r))
-            x_new_br = int(round(pt_br[0] + (BEV_HEIGHT - pt_br[1]) * (pt_tr[0] - pt_br[0]) / dy_r))
+            x_new_br = int(
+                round(pt_br[0] + (BEV_HEIGHT - pt_br[1]) * (pt_tr[0] - pt_br[0]) / dy_r)
+            )
         else:
             x_new_tr = pt_tr[0]
             x_new_br = pt_br[0]
@@ -235,7 +310,7 @@ def build_occupancy_grid(
             [x_new_bl, BEV_HEIGHT],
             [x_new_tl, 0],
             [x_new_tr, 0],
-            [x_new_br, BEV_HEIGHT]
+            [x_new_br, BEV_HEIGHT],
         ]
         pts = np.array(extrapolated_pts, dtype=np.int32)
     else:
@@ -244,64 +319,72 @@ def build_occupancy_grid(
     drivable_mask = np.zeros((BEV_HEIGHT, BEV_WIDTH), dtype=np.uint8)
     cv2.fillPoly(drivable_mask, [pts], 255)
 
-    # Enhance driveable mask with depth-based ground plane estimation
-    if metric_depth_map is not None and np.any(metric_depth_map > 0.5):
-        depth_mask = estimate_driveable_mask(
-            metric_depth_map, image_shape, camera_intrinsics,
-        )
-        if np.any(depth_mask > 0):
-            # Union: pixel is driveable if EITHER polygon OR depth says so
-            combined_mask = np.maximum(drivable_mask, depth_mask)
-            grid[combined_mask == 0] = 150  # 150 = high cost, but passable if needed to curve
-        else:
-            # Fallback to polygon-only if depth estimation produced nothing
-            grid[drivable_mask == 0] = 150
-    else:
-        grid[drivable_mask == 0] = 150
+    # Strictly enforce the road polygon. 
+    # Using np.maximum allowed the car to drive on grass, and cv2.bitwise_and 
+    # fragments the road because the stereo depth mask is too noisy.
+    combined_mask = drivable_mask
 
+    # Connected Component Analysis (Agar trotoar tidak dianggap jalan)
+    ego_x = BEV_WIDTH // 2
+    ego_y = BEV_HEIGHT - _HOOD_CLEAR_ROWS - 5
+
+    # Gunakan fungsi get_connected_drivable_mask yang kita buat sebelumnya
+    connected_driveable = get_connected_drivable_mask(combined_mask, ego_x, ego_y)
+
+    # 2. Bangun Costmap OGM
+    # 0   = Jalan Aman
+    # 240 = Off-Road / Trotoar (Dinding)
+    # 255 = Rintangan Fisik (Objek)
+    grid[connected_driveable == 0] = 240
+
+    # Hitung penambahan piksel untuk Configuration Space (Minkowski Sum)
+    delta_w_px = int(_DELTA_W_M * PIXELS_PER_METER)
+    delta_h_px = int(_DELTA_H_M * PIXELS_PER_METER)
+
+    # 3. Proyeksikan Objek YOLO ke Grid dengan Configuration Space
     for det in detections:
         bbox = det.get("bounding_box", [0, 0, 0, 0])
         dist = float(det.get("distance_m") or 0.0)
         if dist <= 0:
             continue
 
-        # --- KOORDINAT LATERAL (KIRI-KANAN) ---
         bbox_cx = (bbox[0] + bbox[2]) * 0.5
         X_meters = ((bbox_cx - cx) * dist) / fx
 
         x_bev = int(BEV_WIDTH // 2 + X_meters * PIXELS_PER_METER)
         y_bev = int(BEV_HEIGHT - dist * PIXELS_PER_METER)
 
-        # Hitung lebar fisik objek dalam METER
         w_image_px = bbox[2] - bbox[0]
         W_meters = (w_image_px * dist) / fx
-
-        # Hitung panjang/kedalaman fisik objek dalam METER
         h_image_px = bbox[3] - bbox[1]
         H_meters = (h_image_px * dist) / fy
 
-        # Konversi ukuran meter ke skala grid OGM
         w_bev = int(W_meters * PIXELS_PER_METER)
         h_bev = int(H_meters * PIXELS_PER_METER)
 
-        # Tambahkan batas minimum (clamping)
-        w_bev = max(w_bev, 4)  # Minimum 4 pixel lebar
-        h_bev = max(h_bev, 4)  # Minimum 4 pixel panjang
+        w_bev = max(w_bev, 4)
+        h_bev = max(h_bev, 4)
 
-        # Titik tengah bawah objek (y_bev sudah posisi terjauh di grid dari atas)
-        x1_grid = x_bev - (w_bev // 2)
-        y1_grid = y_bev - h_bev  # Memanjang ke atas grid (menjauh dari observer jika BEV origin di bawah)
-        x2_grid = x_bev + (w_bev // 2)
-        y2_grid = y_bev
+        # --- MINKOWSKI SUM (CONFIGURATION SPACE) ---
+        # Perbesar objek secara presisi (persegi panjang) sesuai dimensi mobil + margin 15cm
+        w_bev_final = w_bev + delta_w_px
+        h_bev_final = h_bev + delta_h_px
 
-        # Clip agar tidak keluar dari batas canvas
+        # Gunakan y_bev sebagai TITIK TENGAH objek (bukan bumper belakang)
+        x1_grid = x_bev - (w_bev_final // 2)
+        y1_grid = y_bev - (h_bev_final // 2)
+        x2_grid = x_bev + (w_bev_final // 2)
+        y2_grid = y_bev + (h_bev_final // 2)
+
         x1, y1, x2, y2 = _clip_rect(x1_grid, y1_grid, x2_grid, y2_grid)
         cv2.rectangle(grid, (x1, y1), (x2, y2), 255, -1)
 
-    inflation_px = max(1, int(_INFLATION_RADIUS_M * PIXELS_PER_METER))
-    ksize = inflation_px * 2 + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-    grid = cv2.dilate(grid, kernel, iterations=1)
+    # 4. Morfologi Penutup Celah (Sangat Kecil)
+    # Hapus cv2.dilate raksasa! Kita hanya butuh 1 iterasi kotak 3x3 untuk menutupi noise depth map.
+    kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    obstacle_mask = (grid == 255).astype(np.uint8)
+    obstacle_mask = cv2.dilate(obstacle_mask, kernel_small, iterations=1)
+    grid[obstacle_mask == 1] = 255
 
     grid[BEV_HEIGHT - _HOOD_CLEAR_ROWS :, :] = 0
 
@@ -315,8 +398,10 @@ def astar(grid: np.ndarray, start: tuple, goal: tuple) -> List[Tuple[int, int]]:
         return float(np.hypot(a[0] - b[0], a[1] - b[1]))
 
     def valid(p):
+        # PERUBAHAN KUNCI: Hanya izinkan sel dengan nilai < 240
+        # 240 adalah Off-Road, 255 adalah Rintangan. Keduanya tidak boleh diinjak.
         return (
-            0 <= p[0] < BEV_WIDTH and 0 <= p[1] < BEV_HEIGHT and grid[p[1], p[0]] <= 200
+            0 <= p[0] < BEV_WIDTH and 0 <= p[1] < BEV_HEIGHT and grid[p[1], p[0]] < 240
         )
 
     open_heap = [(heuristic(start, goal), 0.0, start, (0, 0))]
@@ -347,8 +432,10 @@ def astar(grid: np.ndarray, start: tuple, goal: tuple) -> List[Tuple[int, int]]:
 
             move_cost = 1.4142 if dx and dy else 1.0
             cell_val = int(grid[nxt[1], nxt[0]])
+
+            # Penalti biaya yang lebih agresif untuk area yang bukan 0
             if cell_val > 0:
-                move_cost += (cell_val / 255.0) ** 2 * 15.0
+                move_cost += (cell_val / 255.0) ** 2 * 50.0  # Naikkan dari 15.0 ke 50.0
 
             if parent_dir != (0, 0) and (dx, dy) != parent_dir:
                 move_cost += _TURN_PENALTY
@@ -363,13 +450,15 @@ def astar(grid: np.ndarray, start: tuple, goal: tuple) -> List[Tuple[int, int]]:
     return []
 
 
-def _smooth_moving_average(waypoints: List[Tuple[int, int]], window: int = 15) -> List[Tuple[int, int]]:
+def _smooth_moving_average(
+    waypoints: List[Tuple[int, int]], window: int = 15
+) -> List[Tuple[int, int]]:
     if not waypoints or len(waypoints) < 3:
         return [(int(x), int(y)) for x, y in waypoints]
 
     # 1. Linear interpolation to increase density of waypoints (1 point every 2 pixels)
     points = np.array(waypoints, dtype=np.float32)
-    dists = np.sqrt(np.diff(points[:, 0])**2 + np.diff(points[:, 1])**2)
+    dists = np.sqrt(np.diff(points[:, 0]) ** 2 + np.diff(points[:, 1]) ** 2)
     cum_dists = np.concatenate(([0], np.cumsum(dists)))
 
     new_dists = np.arange(0, cum_dists[-1], 2.0)
@@ -398,7 +487,9 @@ def _smooth_moving_average(waypoints: List[Tuple[int, int]], window: int = 15) -
     return [(int(round(x)), int(round(y))) for x, y in smoothed]
 
 
-def smooth_path(waypoints: List[Tuple[int, int]], window: int = 15) -> List[Tuple[int, int]]:
+def smooth_path(
+    waypoints: List[Tuple[int, int]], window: int = 15
+) -> List[Tuple[int, int]]:
     """Smooth raw A* waypoints using cubic spline interpolation.
 
     Produces natural, curved trajectories instead of grid-aligned angular
@@ -441,8 +532,8 @@ def smooth_path(waypoints: List[Tuple[int, int]], window: int = 15) -> List[Tupl
         return [(int(x), int(y)) for x, y in waypoints]
 
     # --- 3. Fit natural cubic spline on X(t) and Y(t) --------------------
-    cs_x = CubicSpline(t, control_pts[:, 0], bc_type='natural')
-    cs_y = CubicSpline(t, control_pts[:, 1], bc_type='natural')
+    cs_x = CubicSpline(t, control_pts[:, 0], bc_type="natural")
+    cs_y = CubicSpline(t, control_pts[:, 1], bc_type="natural")
 
     # --- 4. Evaluate at ~1 pt every 2 px along the curve ------------------
     n_eval = max(20, int(total_length / 2.0))
@@ -465,15 +556,21 @@ def compute_path(
     image_shape: tuple,
     road_polygon_abs: np.ndarray,
     camera_intrinsics: dict = None,
+    frame_bgr: np.ndarray = None,
 ) -> Dict:
     grid = build_occupancy_grid(
-        detections, metric_depth_map, image_shape, road_polygon_abs,
-        camera_intrinsics=camera_intrinsics
+        detections,
+        metric_depth_map,
+        image_shape,
+        road_polygon_abs,
+        camera_intrinsics=camera_intrinsics,
+        frame_bgr=frame_bgr,
     )
 
     def is_valid_node(p):
+        # Hanya izinkan node yang BUKAN off-road (240) dan BUKAN rintangan (255)
         return (
-            0 <= p[0] < BEV_WIDTH and 0 <= p[1] < BEV_HEIGHT and grid[p[1], p[0]] <= 200
+            0 <= p[0] < BEV_WIDTH and 0 <= p[1] < BEV_HEIGHT and grid[p[1], p[0]] < 240
         )
 
     center_x = BEV_WIDTH // 2
@@ -504,86 +601,24 @@ def compute_path(
             "road_coverage_ratio": 0.0,
         }
 
-    # --- 2. Goal selection ---
-    ego_corridor = grid[15 : BEV_HEIGHT - _HOOD_CLEAR_ROWS, ego_left:ego_right]
-    blocked_rows = np.where(np.any(ego_corridor > 200, axis=1))[0]
-
+    # --- 2. Goal selection (Always Go Long) ---
     goal_candidates: List[Tuple[int, int]] = []
-
-    # DYNAMIC GOAL: Find the center of the driveable area at the top of the grid
-    top_section = grid[20:60, :]  # Look at the horizon area
-    # Find columns that are strictly road (value 0)
-    free_cols = np.where(np.sum(top_section == 0, axis=0) > 30)[0]
+    drivable_mask = (grid < 240).astype(np.uint8)
+    valid_ys, valid_xs = np.where(drivable_mask > 0)
     
-    if len(free_cols) > 0:
-        # Aim for the middle of the free space at the top
-        dynamic_goal_x = int(np.mean(free_cols))
-        goal_candidates.append(_snap_goal(grid, (dynamic_goal_x, 30)))
-    else:
-        # Fallback: Look for passable off-road (150) if no strict road (0) is found
-        passable_cols = np.where(np.sum(top_section <= 150, axis=0) > 30)[0]
-        if len(passable_cols) > 0:
-            dynamic_goal_x = int(np.mean(passable_cols))
-            goal_candidates.append(_snap_goal(grid, (dynamic_goal_x, 30)))
-        else:
-            # Absolute fallback to center
-            goal_candidates.append(_snap_goal(grid, (center_x, 15)))
-
-    if len(blocked_rows) > 0:
-        closest_obs_y = 15 + blocked_rows[-1]
-        dist_m = ((BEV_HEIGHT - _HOOD_CLEAR_ROWS) - closest_obs_y) / PIXELS_PER_METER
-
-        if dist_m > _CRUISE_DIST_M:
-            # ACC: goal between ego and obstacle (not past it)
-            acc_y = min(BEV_HEIGHT - 50, closest_obs_y + _ACC_BACKSTOP_PX)
-            goal_candidates.append(_snap_goal(grid, (center_x, int(acc_y))))
-        else:
-            # Overtake: depth-bounded lane check at overtake depth only
-            overtake_y = max(
-                15,
-                closest_obs_y
-                - _OVERTAKE_CLEARANCE_PX
-                - int(_EGO_LENGTH_M * PIXELS_PER_METER),
-            )
-            check_row_top = max(15, overtake_y - 10)
-            check_row_bot = min(BEV_HEIGHT - _HOOD_CLEAR_ROWS, overtake_y + 10)
-
-            left_blocked = np.any(
-                grid[
-                    check_row_top:check_row_bot,
-                    max(0, ego_left - _LANE_CHECK_STRIP_PX) : ego_left,
-                ]
-                > 200
-            )
-            right_blocked = np.any(
-                grid[
-                    check_row_top:check_row_bot,
-                    ego_right : min(BEV_WIDTH, ego_right + _LANE_CHECK_STRIP_PX),
-                ]
-                > 200
-            )
-
-            if not right_blocked:
-                goal_candidates.append(
-                    _snap_goal(grid, (center_x + _OVERTAKE_LATERAL_PX, overtake_y))
-                )
-            if not left_blocked:
-                goal_candidates.append(
-                    _snap_goal(grid, (center_x - _OVERTAKE_LATERAL_PX, overtake_y))
-                )
+    if len(valid_ys) > 0:
+        # Primary Goal: The furthest reachable valid area (minimum Y)
+        min_y = np.min(valid_ys)
+        top_y_limit = min_y + 20 
+        top_xs = valid_xs[valid_ys <= top_y_limit]
+        if len(top_xs) > 0:
+            target_x = int(np.median(top_xs))
+            target_y = int(np.median(valid_ys[valid_ys <= top_y_limit]))
+            goal_candidates.append(_snap_goal(grid, (target_x, target_y)))
 
     valid_goals = [g for g in goal_candidates if is_valid_node(g)]
     if not valid_goals:
-        # Fallback: stop safely behind the obstacle
-        if len(blocked_rows) > 0:
-            closest_obs_y = 15 + blocked_rows[-1]
-            stop_y = min(BEV_HEIGHT - 50, closest_obs_y + int(5 * PIXELS_PER_METER))
-            stop_goal = _snap_goal(grid, (center_x, max(15, int(stop_y))))
-            if is_valid_node(stop_goal):
-                valid_goals = [stop_goal]
-        
-        if not valid_goals:
-            valid_goals = [(center_x, 10)]  # 10 pixel dari batas atas grid
+        valid_goals = [(center_x, 10)]
 
     ordered_starts = starts
 
@@ -600,7 +635,11 @@ def compute_path(
         if path:
             break
 
-    # Fallback search: if A* to all primary goals failed, try to plan a path to the stop goal
+    # Fallback search: If long path failed (e.g., road is completely blocked across all lanes)
+    # just plan a path to stop safely behind the closest obstacle in the ego lane.
+    ego_corridor = grid[15 : BEV_HEIGHT - _HOOD_CLEAR_ROWS, ego_left:ego_right]
+    blocked_rows = np.where(np.any(ego_corridor > 200, axis=1))[0]
+    
     if (not path or len(path) < 2) and len(blocked_rows) > 0:
         closest_obs_y = 15 + blocked_rows[-1]
         stop_y = min(BEV_HEIGHT - 50, closest_obs_y + int(5 * PIXELS_PER_METER))

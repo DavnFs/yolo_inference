@@ -22,6 +22,15 @@ DRIVES_METADATA = {
     "0005": {"drive_name": "2011_09_26_drive_0005_sync", "date": "2011_09_26"},
     "0009": {"drive_name": "2011_09_26_drive_0009_sync", "date": "2011_09_26"},
     "0011": {"drive_name": "2011_09_26_drive_0011_sync", "date": "2011_09_26"},
+    "0013": {"drive_name": "2011_09_26_drive_0013_sync", "date": "2011_09_26"},
+    "0014": {"drive_name": "2011_09_26_drive_0014_sync", "date": "2011_09_26"},
+    "0015": {"drive_name": "2011_09_26_drive_0015_sync", "date": "2011_09_26"},
+    "0017": {"drive_name": "2011_09_26_drive_0017_sync", "date": "2011_09_26"},
+    "0018": {"drive_name": "2011_09_26_drive_0018_sync", "date": "2011_09_26"},
+    "0019": {"drive_name": "2011_09_26_drive_0019_sync", "date": "2011_09_26"},
+    "0020": {"drive_name": "2011_09_26_drive_0020_sync", "date": "2011_09_26"},
+    "0022": {"drive_name": "2011_09_26_drive_0022_sync", "date": "2011_09_26"},
+    "0023": {"drive_name": "2011_09_26_drive_0023_sync", "date": "2011_09_26"},
 }
 
 
@@ -106,7 +115,7 @@ def main():
         description="Download KITTI and generate ZED-compatible depth .npy"
     )
     parser.add_argument(
-        "--seq", choices=["0001", "0002", "0005", "0009", "0011"], default="0001"
+        "--seq", choices=["0001", "0002", "0005", "0009", "0011", "0013", "0014", "0015", "0017", "0018", "0019", "0020", "0022", "0023"], default="0001"
     )
     parser.add_argument("--dest", default="stereo_dataset/kitti")
     args = parser.parse_args()
