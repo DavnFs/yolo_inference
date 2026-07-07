@@ -100,7 +100,7 @@ def estimate_driveable_mask(
     image_shape: tuple,
     camera_intrinsics: dict = None,
     camera_height_m: float = 1.65,
-    depth_tolerance_ratio: float = 0.40,
+    depth_tolerance_ratio: float = 0.25,
     frame_bgr: np.ndarray = None,
 ) -> np.ndarray:
     """Estimate driveable area from depth map using ground plane model.
@@ -155,7 +155,7 @@ def estimate_driveable_mask(
     valid_mask = actual_depth > 0.5
     depth_error = np.abs(actual_depth - expected_z_map)
     # Tighten tolerance to prevent classifying sidewalks/walls as road
-    tolerance = expected_z_map * depth_tolerance_ratio + 0.5
+    tolerance = expected_z_map * depth_tolerance_ratio + 0.3
     ground_mask_road = valid_mask & (depth_error < tolerance)
 
     # NEW: reject vegetation-colored pixels even if they passed the
@@ -319,8 +319,8 @@ def build_occupancy_grid(
     drivable_mask = np.zeros((BEV_HEIGHT, BEV_WIDTH), dtype=np.uint8)
     cv2.fillPoly(drivable_mask, [pts], 255)
 
-    # Strictly enforce the road polygon. 
-    # Using np.maximum allowed the car to drive on grass, and cv2.bitwise_and 
+    # Strictly enforce the road polygon.
+    # Using np.maximum allowed the car to drive on grass, and cv2.bitwise_and
     # fragments the road because the stereo depth mask is too noisy.
     combined_mask = drivable_mask
 
@@ -336,6 +336,150 @@ def build_occupancy_grid(
     # 240 = Off-Road / Trotoar (Dinding)
     # 255 = Rintangan Fisik (Objek)
     grid[connected_driveable == 0] = 240
+
+    depth_h, depth_w = metric_depth_map.shape[:2]
+
+    # --- Vegetation color rejection: color cue independent of depth ---
+    # Depth-based ground classification can't distinguish grass verges from
+    # asphalt (both satisfy the flat-ground equation), so reject vegetation
+    # pixels using HSV color and mark them off-road (240) in the OGM.
+    try:
+        if frame_bgr is not None:
+            road_start_row = int(depth_h * 0.45)
+            color_mask_road = _get_road_color_mask(
+                frame_bgr, road_start_row, depth_h, depth_w
+            )
+            veg_ys, veg_xs = np.where(~color_mask_road)
+            if len(veg_ys) > 0:
+                veg_ys_full = veg_ys + road_start_row
+                z_veg = metric_depth_map[veg_ys_full, veg_xs]
+                valid_veg = (z_veg > 0.5) & (z_veg < 40.0)
+                if np.any(valid_veg):
+                    x_m_veg = (veg_xs[valid_veg] - cx) * z_veg[valid_veg] / fx
+                    x_grid_veg = (BEV_WIDTH / 2.0 + x_m_veg * PIXELS_PER_METER).astype(
+                        np.int32
+                    )
+                    y_grid_veg = (
+                        BEV_HEIGHT - z_veg[valid_veg] * PIXELS_PER_METER
+                    ).astype(np.int32)
+                    in_bounds_veg = (
+                        (x_grid_veg >= 0)
+                        & (x_grid_veg < BEV_WIDTH)
+                        & (y_grid_veg >= 0)
+                        & (y_grid_veg < BEV_HEIGHT)
+                    )
+                    grid[y_grid_veg[in_bounds_veg], x_grid_veg[in_bounds_veg]] = 240
+    except Exception:
+        pass  # Vegetation rejection is a refinement, never block the OGM on it
+
+    # --- Curb / sidewalk-edge heuristic: sharp local depth discontinuity ---
+    # A flat road has low local depth variance; a curb or sidewalk lip creates
+    # a jump. Flag these as soft obstacles (penalized, not blocked) so A*
+    # prefers to avoid road edges even when the polygon is mis-estimated.
+    try:
+        road_start_row = int(depth_h * 0.45)
+        road_region = metric_depth_map[road_start_row:depth_h, :].astype(np.float32)
+        local_mean = cv2.blur(road_region, (5, 5))
+        local_mean_sq = cv2.blur(road_region * road_region, (5, 5))
+        local_std = np.sqrt(np.maximum(local_mean_sq - local_mean * local_mean, 0.0))
+
+        curb_candidates = (local_std > 1.5) & (road_region > 0.5) & (road_region < 20.0)
+        # Subsample every 3rd pixel for performance
+        curb_ys, curb_xs = np.where(curb_candidates[::3, ::3])
+        if len(curb_ys) > 0:
+            curb_ys = curb_ys * 3 + road_start_row
+            curb_xs = curb_xs * 3
+            z_curb = metric_depth_map[curb_ys, curb_xs]
+            x_m_curb = (curb_xs - cx) * z_curb / fx
+            x_grid_curb = (BEV_WIDTH / 2.0 + x_m_curb * PIXELS_PER_METER).astype(
+                np.int32
+            )
+            y_grid_curb = (BEV_HEIGHT - z_curb * PIXELS_PER_METER).astype(np.int32)
+            in_bounds_curb = (
+                (x_grid_curb >= 0)
+                & (x_grid_curb < BEV_WIDTH)
+                & (y_grid_curb >= 0)
+                & (y_grid_curb < BEV_HEIGHT)
+            )
+            x_grid_curb = x_grid_curb[in_bounds_curb]
+            y_grid_curb = y_grid_curb[in_bounds_curb]
+            # Soft obstacle only — don't downgrade cells already >= 200
+            below_wall = grid[y_grid_curb, x_grid_curb] < 200
+            grid[y_grid_curb[below_wall], x_grid_curb[below_wall]] = 200
+    except Exception:
+        pass  # Curb heuristic is a refinement, never block the OGM on it
+
+    # --- Dense depth-map pass: probabilistic occupancy for undetected obstacles ---
+    # YOLO only flags known object classes. Walls, curbs, and vegetation the
+    # detector misses are otherwise treated as free space. This projects every
+    # non-ground depth pixel into the grid as a probabilistic obstacle so the
+    # OGM reflects the whole scene, not just YOLO detections.
+    try:
+        step = 3
+        v_coords = np.arange(0, depth_h, step, dtype=np.float32)
+        u_coords = np.arange(0, depth_w, step, dtype=np.float32)
+        uu, vv = np.meshgrid(u_coords, v_coords)
+
+        z_actual = metric_depth_map[::step, ::step].astype(np.float32)
+        min_h = min(z_actual.shape[0], uu.shape[0])
+        min_w = min(z_actual.shape[1], uu.shape[1])
+        z_actual = z_actual[:min_h, :min_w]
+        uu = uu[:min_h, :min_w]
+        vv = vv[:min_h, :min_w]
+
+        v_rel = np.maximum(vv - cy, 1.0)
+        z_expected = (fy * camera_height_m) / v_rel
+        is_ground = np.abs(z_actual - z_expected) < (z_expected * 0.35)
+
+        valid_depth = (z_actual > 0.5) & (z_actual < 50.0)
+        obstacle_candidates = valid_depth & ~is_ground
+
+        obs_v, obs_u = np.where(obstacle_candidates)
+        if len(obs_v) > 0:
+            z_obs = z_actual[obs_v, obs_u]
+            u_obs = uu[obs_v, obs_u]
+
+            x_m_obs = (u_obs - cx) * z_obs / fx
+            x_grid_obs = (BEV_WIDTH / 2.0 + x_m_obs * PIXELS_PER_METER).astype(np.int32)
+            y_grid_obs = (BEV_HEIGHT - z_obs * PIXELS_PER_METER).astype(np.int32)
+
+            in_bounds_obs = (
+                (x_grid_obs >= 0)
+                & (x_grid_obs < BEV_WIDTH)
+                & (y_grid_obs >= 0)
+                & (y_grid_obs < BEV_HEIGHT)
+            )
+            x_grid_obs = x_grid_obs[in_bounds_obs]
+            y_grid_obs = y_grid_obs[in_bounds_obs]
+            z_obs = z_obs[in_bounds_obs]
+
+            # Only paint the probabilistic layer inside the drivable corridor.
+            # Off-corridor cells are already hard-set to 240 by the
+            # connected_driveable pass above, so a lower probabilistic value
+            # there would be a no-op anyway (and Fix 2 relies on 240 staying
+            # a hard wall for sidewalks/vegetation). This is where dense
+            # depth actually adds information: obstacles inside the road
+            # corridor that YOLO never classified, which previously stayed 0.
+            on_road = connected_driveable[y_grid_obs, x_grid_obs] == 255
+            keep = on_road
+            x_grid_obs = x_grid_obs[keep]
+            y_grid_obs = y_grid_obs[keep]
+            z_obs = z_obs[keep]
+
+            prob_vals = np.clip(255 * (1.0 - z_obs / 50.0), 30, 200).astype(np.uint8)
+
+            # Inverse distance weighting: keep the strongest (closest) reading per cell
+            current_vals = grid[y_grid_obs, x_grid_obs]
+            grid[y_grid_obs, x_grid_obs] = np.maximum(current_vals, prob_vals)
+
+        # Smooth the probabilistic region for paper-style gradients, leaving
+        # confirmed off-road (240) and physical obstacles (255) untouched.
+        soft_mask = (grid > 0) & (grid < 240)
+        if np.any(soft_mask):
+            blurred = cv2.GaussianBlur(grid, (5, 5), 1.5)
+            grid[soft_mask] = blurred[soft_mask]
+    except Exception:
+        pass  # Dense depth pass is a refinement, fall back to YOLO-only OGM
 
     # Hitung penambahan piksel untuk Configuration Space (Minkowski Sum)
     delta_w_px = int(_DELTA_W_M * PIXELS_PER_METER)
@@ -605,11 +749,11 @@ def compute_path(
     goal_candidates: List[Tuple[int, int]] = []
     drivable_mask = (grid < 240).astype(np.uint8)
     valid_ys, valid_xs = np.where(drivable_mask > 0)
-    
+
     if len(valid_ys) > 0:
         # Primary Goal: The furthest reachable valid area (minimum Y)
         min_y = np.min(valid_ys)
-        top_y_limit = min_y + 20 
+        top_y_limit = min_y + 20
         top_xs = valid_xs[valid_ys <= top_y_limit]
         if len(top_xs) > 0:
             target_x = int(np.median(top_xs))
@@ -639,7 +783,7 @@ def compute_path(
     # just plan a path to stop safely behind the closest obstacle in the ego lane.
     ego_corridor = grid[15 : BEV_HEIGHT - _HOOD_CLEAR_ROWS, ego_left:ego_right]
     blocked_rows = np.where(np.any(ego_corridor > 200, axis=1))[0]
-    
+
     if (not path or len(path) < 2) and len(blocked_rows) > 0:
         closest_obs_y = 15 + blocked_rows[-1]
         stop_y = min(BEV_HEIGHT - 50, closest_obs_y + int(5 * PIXELS_PER_METER))

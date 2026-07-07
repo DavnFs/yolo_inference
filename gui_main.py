@@ -1,32 +1,62 @@
 # File: gui_main.py
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from PIL import Image, ImageTk
 import os
+import random
 import subprocess
-import cv2
 import threading
 import time
+import tkinter as tk
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-import random
-import numpy as np
+from tkinter import filedialog, messagebox, ttk
 
-from app.core.services.object_detection import (
-    get_combined_prediction_from_frame,
-    perform_road_analysis,
-    draw_main_visualization,
-    set_active_model,
-    discover_models
-)
+import cv2
+import numpy as np
+from PIL import Image, ImageTk
+
 from app.core.services.bev_projection import (
     backproject_detections,
-    render_bev_opencv,
-    render_dense_bev,
     intrinsics_from_calib,
     intrinsics_from_frame_width,
+    render_bev_opencv,
+    render_dense_bev,
 )
+from app.core.services.object_detection import (
+    discover_models,
+    draw_main_visualization,
+    get_combined_prediction_from_frame,
+    perform_road_analysis,
+    set_active_model,
+)
+
+
+def render_ogm_colormap(grid: np.ndarray) -> np.ndarray:
+    """Render OGM grid as colormap image matching paper visualizations.
+
+    - Free space (0): black
+    - Probabilistic obstacles (1-239): PLASMA colormap (blue -> yellow)
+    - Off-road boundary (240): dark orange
+    - Hard YOLO obstacles (255): bright red
+    """
+    display = np.zeros((*grid.shape, 3), dtype=np.uint8)
+
+    # Free space: black (already zeros)
+
+    # Probabilistic obstacles (depth-derived, 1-239): plasma colormap
+    prob_mask = (grid > 0) & (grid < 240)
+    if np.any(prob_mask):
+        prob_vals = grid[prob_mask].astype(np.float32)
+        normalized = (prob_vals / 239.0 * 255).astype(np.uint8)
+        plasma = cv2.applyColorMap(normalized.reshape(-1, 1), cv2.COLORMAP_PLASMA)
+        display[prob_mask] = plasma.reshape(-1, 3)
+
+    # Off-road boundary (240): dark orange
+    display[grid == 240] = (0, 80, 180)  # BGR: dark orange
+
+    # Hard YOLO obstacles (255): bright red
+    display[grid == 255] = (0, 0, 255)  # BGR: red
+
+    return display
 
 
 class StereoSimLoader:
@@ -38,7 +68,9 @@ class StereoSimLoader:
         self.disp_dir = os.path.join(root_dir, "depth_npy")
         self._frame_list = []
         if os.path.isdir(self.left_dir) and os.path.isdir(self.disp_dir):
-            left_files = sorted(f for f in os.listdir(self.left_dir) if f.lower().endswith(".png"))
+            left_files = sorted(
+                f for f in os.listdir(self.left_dir) if f.lower().endswith(".png")
+            )
             for fname in left_files:
                 base_name = os.path.splitext(fname)[0]
                 npy_name = f"{base_name}.npy"
@@ -81,21 +113,44 @@ class StereoSimLoader:
         target_w = 640
         ratio = target_w / frame_bgr.shape[1]
         target_h = int(frame_bgr.shape[0] * ratio)
-        frame_bgr = cv2.resize(frame_bgr, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-        depth_m = cv2.resize(depth_m, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        frame_bgr = cv2.resize(
+            frame_bgr, (target_w, target_h), interpolation=cv2.INTER_LINEAR
+        )
+        depth_m = cv2.resize(
+            depth_m, (target_w, target_h), interpolation=cv2.INTER_NEAREST
+        )
 
         return True, frame_bgr, depth_m
 
+
 THEMES = {
-    "dark":  {"BG": "#212121", "FRAME": "#2E2E2E", "TEXT": "#FFFFFF", "ACCENT": "#00A0A0", "CANVAS": "black",   "BTN_FG": "white", "STATUS": "#2E2E2E", "PLACEHOLDER": "#757575"},
-    "light": {"BG": "#F5F5F5", "FRAME": "#FFFFFF", "TEXT": "#000000", "ACCENT": "#00796B", "CANVAS": "#BDBDBD", "BTN_FG": "white", "STATUS": "#E0E0E0", "PLACEHOLDER": "#616161"}
+    "dark": {
+        "BG": "#212121",
+        "FRAME": "#2E2E2E",
+        "TEXT": "#FFFFFF",
+        "ACCENT": "#00A0A0",
+        "CANVAS": "black",
+        "BTN_FG": "white",
+        "STATUS": "#2E2E2E",
+        "PLACEHOLDER": "#757575",
+    },
+    "light": {
+        "BG": "#F5F5F5",
+        "FRAME": "#FFFFFF",
+        "TEXT": "#000000",
+        "ACCENT": "#00796B",
+        "CANVAS": "#BDBDBD",
+        "BTN_FG": "white",
+        "STATUS": "#E0E0E0",
+        "PLACEHOLDER": "#616161",
+    },
 }
 FONTS = {
-    "normal":      ("Segoe UI", 9),
-    "bold":        ("Segoe UI", 9, "bold"),
-    "title":       ("Segoe UI", 10, "bold"),
-    "value":       ("Segoe UI", 14, "bold"),
-    "placeholder": ("Segoe UI", 11, "italic")
+    "normal": ("Segoe UI", 9),
+    "bold": ("Segoe UI", 9, "bold"),
+    "title": ("Segoe UI", 10, "bold"),
+    "value": ("Segoe UI", 14, "bold"),
+    "placeholder": ("Segoe UI", 11, "italic"),
 }
 
 
@@ -104,7 +159,7 @@ class DashboardGUI:
         self.master = master
         master.title("Road Analysis Dashboard")
         master.minsize(800, 480)
-        master.attributes('-fullscreen', True)
+        master.attributes("-fullscreen", True)
 
         self.is_dark_mode = True
         self.processing_thread = None
@@ -133,35 +188,37 @@ class DashboardGUI:
         self._bag_path = None
 
         # View state — satu canvas besar, 4 view yang bisa diswitch
-        self._active_view = "rgb"          # "rgb" | "depth" | "bev" | "ogm"
+        self._active_view = "rgb"  # "rgb" | "depth" | "bev" | "ogm"
         self._nav_buttons = {}
 
         # Stored latest frames untuk setiap view (BGR numpy array)
-        self._latest_rgb_frame   = None
+        self._latest_rgb_frame = None
         self._latest_depth_frame = None
-        self._latest_bev_frame   = None
-        self._latest_ogm_frame   = None
+        self._latest_bev_frame = None
+        self._latest_ogm_frame = None
 
         # Pending flags per view
         self._canvas_update_pending = False
-        self._depth_update_pending  = False
-        self._bev_update_pending    = False
-        self._ogm_update_pending    = False
+        self._depth_update_pending = False
+        self._bev_update_pending = False
+        self._ogm_update_pending = False
 
         # BEV/OGM source data
         self._latest_bev_detections = None
-        self._latest_path_data      = None
-        self._latest_ogm_grid       = None
-        self._latest_ogm_path       = None
+        self._latest_path_data = None
+        self._latest_ogm_grid = None
+        self._latest_ogm_path = None
 
         # Optimasi A: Frame skip — BEV + path planning tidak diupdate setiap frame
-        self._frame_counter       = 0
-        self._bev_skip_interval   = 2   # GPU: setiap frame OK; CPU: skip 1 dari 2
-        self._path_skip_interval  = 2   # path planning (A*) setiap 2 frame
+        self._frame_counter = 0
+        self._bev_skip_interval = 2  # GPU: setiap frame OK; CPU: skip 1 dari 2
+        self._path_skip_interval = 2  # path planning (A*) setiap 2 frame
 
         # Optimasi B: Thread pool untuk render BEV dan OGM
         # max_workers=2: satu untuk BEV render, satu untuk OGM render
-        self._render_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="render")
+        self._render_pool = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="render"
+        )
 
         # --- AUTO-DISCOVERY ---
         base_path = os.path.dirname(__file__)
@@ -171,7 +228,7 @@ class DashboardGUI:
         if not self.model_configs:
             messagebox.showerror(
                 "No Models Found",
-                f"No .onnx files found in:\n{models_dir}\n\nPlease add model files and restart."
+                f"No .onnx files found in:\n{models_dir}\n\nPlease add model files and restart.",
             )
             master.destroy()
             return
@@ -181,43 +238,89 @@ class DashboardGUI:
         self._apply_theme()
         self._update_dummy_data()
         self.master.protocol("WM_DELETE_WINDOW", self.on_closing)
-        self.master.bind("<Escape>", lambda e: self.master.attributes("-fullscreen", False))
+        self.master.bind(
+            "<Escape>", lambda e: self.master.attributes("-fullscreen", False)
+        )
 
     # -------------------------------------------------------------------------
 
     def _setup_style(self):
         self.style = ttk.Style()
-        self.style.theme_use('clam')
+        self.style.theme_use("clam")
 
     def _apply_theme(self):
         colors = THEMES["dark"] if self.is_dark_mode else THEMES["light"]
         self.master.configure(bg=colors["BG"])
-        self.style.configure("TFrame",            background=colors["BG"])
-        self.style.configure("TLabel",            background=colors["BG"],    foreground=colors["TEXT"],       font=FONTS["normal"])
-        self.style.configure("Card.TFrame",       background=colors["FRAME"])
-        self.style.configure("Header.TLabel",     background=colors["FRAME"], foreground=colors["ACCENT"],     font=FONTS["bold"])
-        self.style.configure("Value.TLabel",      background=colors["FRAME"], foreground=colors["TEXT"],       font=FONTS["value"])
-        self.style.configure("TButton",           background=colors["ACCENT"],foreground=colors["BTN_FG"],     font=FONTS["bold"], borderwidth=0)
-        self.style.map("TButton",                 background=[('active', colors["ACCENT"])])
-        self.style.configure("TCombobox",         fieldbackground=colors["FRAME"], background=colors["FRAME"],
-                                                  foreground=colors["TEXT"], arrowcolor=colors["TEXT"],
-                                                  selectbackground=colors["FRAME"], selectforeground=colors["TEXT"],
-                                                  font=FONTS["normal"])
-        self.style.configure("TCheckbutton",      background=colors["BG"],    foreground=colors["TEXT"],       font=FONTS["normal"])
-        self.style.map("TCheckbutton",            indicatorcolor=[('selected', colors["ACCENT"])])
-        self.style.configure("Status.TLabel",     background=colors["STATUS"],foreground=colors["TEXT"],       font=FONTS["normal"], padding=5)
-        self.style.configure("Placeholder.TLabel",background=colors["FRAME"], foreground=colors["PLACEHOLDER"],font=FONTS["placeholder"], anchor="center")
-        if hasattr(self, 'main_canvas'):
+        self.style.configure("TFrame", background=colors["BG"])
+        self.style.configure(
+            "TLabel",
+            background=colors["BG"],
+            foreground=colors["TEXT"],
+            font=FONTS["normal"],
+        )
+        self.style.configure("Card.TFrame", background=colors["FRAME"])
+        self.style.configure(
+            "Header.TLabel",
+            background=colors["FRAME"],
+            foreground=colors["ACCENT"],
+            font=FONTS["bold"],
+        )
+        self.style.configure(
+            "Value.TLabel",
+            background=colors["FRAME"],
+            foreground=colors["TEXT"],
+            font=FONTS["value"],
+        )
+        self.style.configure(
+            "TButton",
+            background=colors["ACCENT"],
+            foreground=colors["BTN_FG"],
+            font=FONTS["bold"],
+            borderwidth=0,
+        )
+        self.style.map("TButton", background=[("active", colors["ACCENT"])])
+        self.style.configure(
+            "TCombobox",
+            fieldbackground=colors["FRAME"],
+            background=colors["FRAME"],
+            foreground=colors["TEXT"],
+            arrowcolor=colors["TEXT"],
+            selectbackground=colors["FRAME"],
+            selectforeground=colors["TEXT"],
+            font=FONTS["normal"],
+        )
+        self.style.configure(
+            "TCheckbutton",
+            background=colors["BG"],
+            foreground=colors["TEXT"],
+            font=FONTS["normal"],
+        )
+        self.style.map("TCheckbutton", indicatorcolor=[("selected", colors["ACCENT"])])
+        self.style.configure(
+            "Status.TLabel",
+            background=colors["STATUS"],
+            foreground=colors["TEXT"],
+            font=FONTS["normal"],
+            padding=5,
+        )
+        self.style.configure(
+            "Placeholder.TLabel",
+            background=colors["FRAME"],
+            foreground=colors["PLACEHOLDER"],
+            font=FONTS["placeholder"],
+            anchor="center",
+        )
+        if hasattr(self, "main_canvas"):
             self.main_canvas.config(bg=colors["CANVAS"])
         for btn_key, btn in self._nav_buttons.items():
-            is_active = (btn_key == self._active_view)
+            is_active = btn_key == self._active_view
             bg = colors["ACCENT"] if is_active else colors["FRAME"]
             btn.config(bg=bg, fg=colors["BTN_FG"] if is_active else colors["TEXT"])
 
     # -------------------------------------------------------------------------
 
     def _create_widgets(self):
-        self.master.columnconfigure(0, weight=7)   # display besar
+        self.master.columnconfigure(0, weight=7)  # display besar
         self.master.columnconfigure(1, weight=2, minsize=240)  # control panel
         self.master.rowconfigure(0, weight=1)
 
@@ -242,16 +345,21 @@ class DashboardGUI:
         nav_frame.grid(row=0, column=0, sticky="ew", pady=(0, 4))
 
         views = [
-            ("rgb",   "RGB Video"),
+            ("rgb", "RGB Video"),
             ("depth", "Depth Map"),
-            ("bev",   "BEV"),
-            ("ogm",   "OGM Grid"),
+            ("bev", "BEV"),
+            ("ogm", "OGM Grid"),
         ]
         for view_key, label in views:
             btn = tk.Button(
-                nav_frame, text=label, font=FONTS["bold"],
-                relief="flat", padx=12, pady=6, cursor="hand2",
-                command=lambda k=view_key: self._switch_view(k)
+                nav_frame,
+                text=label,
+                font=FONTS["bold"],
+                relief="flat",
+                padx=12,
+                pady=6,
+                cursor="hand2",
+                command=lambda k=view_key: self._switch_view(k),
             )
             btn.pack(side=tk.LEFT, padx=2, pady=4)
             self._nav_buttons[view_key] = btn
@@ -266,14 +374,17 @@ class DashboardGUI:
         footer_frame.columnconfigure(0, weight=1)
 
         self.show_polygon_check = ttk.Checkbutton(
-            footer_frame, text="Show Polygon",
-            variable=self.show_polygon, style="TCheckbutton",
-            command=self._on_show_polygon_changed
+            footer_frame,
+            text="Show Polygon",
+            variable=self.show_polygon,
+            style="TCheckbutton",
+            command=self._on_show_polygon_changed,
         )
         self.show_polygon_check.pack(side=tk.LEFT, padx=10)
 
-        self.status_label = ttk.Label(footer_frame, text="FPS: - | Latency: - ms",
-                                       style="Status.TLabel")
+        self.status_label = ttk.Label(
+            footer_frame, text="FPS: - | Latency: - ms", style="Status.TLabel"
+        )
         self.status_label.pack(side=tk.RIGHT, padx=10)
 
         # Highlight tombol aktif
@@ -293,10 +404,10 @@ class DashboardGUI:
         self._active_view = view_key
         self._refresh_nav_buttons()
         frame_map = {
-            "rgb":   self._latest_rgb_frame,
+            "rgb": self._latest_rgb_frame,
             "depth": self._latest_depth_frame,
-            "bev":   self._latest_bev_frame,
-            "ogm":   self._latest_ogm_frame,
+            "bev": self._latest_bev_frame,
+            "ogm": self._latest_ogm_frame,
         }
         frame = frame_map.get(view_key)
         if frame is not None:
@@ -313,18 +424,29 @@ class DashboardGUI:
         controls_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
 
         model_names = list(self.model_configs.keys())
-        self.model_combo = ttk.Combobox(controls_frame, values=model_names, state="readonly", width=20)
+        self.model_combo = ttk.Combobox(
+            controls_frame, values=model_names, state="readonly", width=20
+        )
         self.model_combo.set(model_names[0])
         self.model_combo.pack(pady=4, fill=tk.X)
 
         # Refresh button — rescans models folder without restarting
-        ttk.Button(controls_frame, text="↻ Refresh Models", command=self._refresh_models).pack(pady=2, fill=tk.X)
+        ttk.Button(
+            controls_frame, text="↻ Refresh Models", command=self._refresh_models
+        ).pack(pady=2, fill=tk.X)
 
         self.mode_combo = ttk.Combobox(
             controls_frame,
-            values=["Select Source...", "Image File", "Video File", "Webcam",
-                    "Stereo Dataset Sim", "ROS 2 Bag"],
-            state="readonly", width=20
+            values=[
+                "Select Source...",
+                "Image File",
+                "Video File",
+                "Webcam",
+                "Stereo Dataset Sim",
+                "ROS 2 Bag",
+            ],
+            state="readonly",
+            width=20,
         )
         self.mode_combo.set("Select Source...")
         self.mode_combo.pack(pady=4, fill=tk.X)
@@ -332,50 +454,79 @@ class DashboardGUI:
 
         # Label nama bag yang dipilih (hanya tampil saat mode ROS 2 Bag)
         self._bag_label_var = tk.StringVar(value="")
-        self.bag_label = ttk.Label(controls_frame, textvariable=self._bag_label_var,
-                                   style="Header.TLabel", wraplength=200, anchor="w")
+        self.bag_label = ttk.Label(
+            controls_frame,
+            textvariable=self._bag_label_var,
+            style="Header.TLabel",
+            wraplength=200,
+            anchor="w",
+        )
         self.bag_label.pack(fill=tk.X)
         self.bag_label.pack_forget()  # sembunyikan dulu
 
-        self.process_button = ttk.Button(controls_frame, text="Start Processing", command=self.toggle_processing)
+        self.process_button = ttk.Button(
+            controls_frame, text="Start Processing", command=self.toggle_processing
+        )
         self.process_button.pack(pady=4, fill=tk.X, ipady=5)
 
-        ttk.Button(controls_frame, text="Toggle Theme", command=self._toggle_theme).pack(pady=4, fill=tk.X, ipady=5)
+        ttk.Button(
+            controls_frame, text="Toggle Theme", command=self._toggle_theme
+        ).pack(pady=4, fill=tk.X, ipady=5)
 
         ttk.Separator(controls_frame, orient="horizontal").pack(fill=tk.X, pady=8)
-        ttk.Label(controls_frame, text="MC Dropout", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(controls_frame, text="MC Dropout", style="Header.TLabel").pack(
+            anchor="w"
+        )
 
         self.mc_pt_label = ttk.Label(
-            controls_frame, text="No .pt loaded",
-            style="Header.TLabel", foreground="gray"
+            controls_frame,
+            text="No .pt loaded",
+            style="Header.TLabel",
+            foreground="gray",
         )
         self.mc_pt_label.pack(fill=tk.X)
-        ttk.Button(controls_frame, text="Load .pt Model",
-                   command=self._load_pt_model).pack(fill=tk.X, pady=2)
+        ttk.Button(
+            controls_frame, text="Load .pt Model", command=self._load_pt_model
+        ).pack(fill=tk.X, pady=2)
 
-        ttk.Checkbutton(controls_frame, text="Enable MC Dropout",
-                        variable=self.mc_dropout_var,
-                        style="TCheckbutton").pack(anchor="w")
+        ttk.Checkbutton(
+            controls_frame,
+            text="Enable MC Dropout",
+            variable=self.mc_dropout_var,
+            style="TCheckbutton",
+        ).pack(anchor="w")
 
-        ttk.Checkbutton(controls_frame, text="Show Uncertainty Overlay",
-                        variable=self.show_uncertainty_var,
-                        style="TCheckbutton").pack(anchor="w")
+        ttk.Checkbutton(
+            controls_frame,
+            text="Show Uncertainty Overlay",
+            variable=self.show_uncertainty_var,
+            style="TCheckbutton",
+        ).pack(anchor="w")
 
         self.mc_samples_label = ttk.Label(
-            controls_frame, text="N Samples: 5",
-            style="Header.TLabel"
+            controls_frame, text="N Samples: 5", style="Header.TLabel"
         )
         self.mc_samples_label.pack(anchor="w")
-        ttk.Scale(controls_frame, from_=1, to=10,
-                  variable=self.mc_n_samples_var, orient="horizontal",
-                  command=self._on_n_samples_change).pack(fill=tk.X)
+        ttk.Scale(
+            controls_frame,
+            from_=1,
+            to=10,
+            variable=self.mc_n_samples_var,
+            orient="horizontal",
+            command=self._on_n_samples_change,
+        ).pack(fill=tk.X)
 
         ttk.Separator(controls_frame, orient="horizontal").pack(fill=tk.X, pady=8)
-        ttk.Label(controls_frame, text="Path Planning", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(controls_frame, text="Path Planning", style="Header.TLabel").pack(
+            anchor="w"
+        )
 
-        ttk.Checkbutton(controls_frame, text="Enable Path Planning (Stereo)",
-                        variable=self.path_planning_var,
-                        style="TCheckbutton").pack(anchor="w")
+        ttk.Checkbutton(
+            controls_frame,
+            text="Enable Path Planning (Stereo)",
+            variable=self.path_planning_var,
+            style="TCheckbutton",
+        ).pack(anchor="w")
 
         # --- Status cards ---
         status_cards_frame = ttk.Frame(parent)
@@ -383,13 +534,13 @@ class DashboardGUI:
         status_cards_frame.columnconfigure(0, weight=1)
         self._create_status_cards_panel(status_cards_frame)
 
-
-
     def _create_status_cards_panel(self, parent):
-        self.speed_label    = self._create_status_card(parent, 0, "SPEED",    "0 Km/h")
-        self.battery_label  = self._create_status_card(parent, 1, "BATTERY",  "0 %")
-        self.location_label = self._create_status_card(parent, 2, "LOCATION", "0.0, 0.0")
-        self.weather_label  = self._create_status_card(parent, 3, "WEATHER",  "N/A")
+        self.speed_label = self._create_status_card(parent, 0, "SPEED", "0 Km/h")
+        self.battery_label = self._create_status_card(parent, 1, "BATTERY", "0 %")
+        self.location_label = self._create_status_card(
+            parent, 2, "LOCATION", "0.0, 0.0"
+        )
+        self.weather_label = self._create_status_card(parent, 3, "WEATHER", "N/A")
 
     def _create_status_card(self, parent, row_index, title, initial_value):
         card = ttk.Frame(parent, style="Card.TFrame", padding=(10, 5))
@@ -409,9 +560,7 @@ class DashboardGUI:
         self.show_polygon_enabled = bool(self.show_polygon.get())
 
     def _load_pt_model(self):
-        path = filedialog.askopenfilename(
-            filetypes=[("PyTorch Model", "*.pt")]
-        )
+        path = filedialog.askopenfilename(filetypes=[("PyTorch Model", "*.pt")])
         if path:
             self.mc_pt_path = path
             name = os.path.basename(path)
@@ -431,10 +580,15 @@ class DashboardGUI:
 
         if model_names:
             self.model_combo.set(model_names[0])
-            messagebox.showinfo("Models Refreshed", f"Found {len(model_names)} model(s):\n" + "\n".join(model_names))
+            messagebox.showinfo(
+                "Models Refreshed",
+                f"Found {len(model_names)} model(s):\n" + "\n".join(model_names),
+            )
         else:
             self.model_combo.set("")
-            messagebox.showwarning("No Models", f"No .onnx files found in:\n{models_dir}")
+            messagebox.showwarning(
+                "No Models", f"No .onnx files found in:\n{models_dir}"
+            )
 
     # -------------------------------------------------------------------------
 
@@ -447,7 +601,9 @@ class DashboardGUI:
         elif mode == "Webcam":
             self.source_path = 0
         elif mode == "Stereo Dataset Sim":
-            self.source_path = filedialog.askdirectory(title="Select Stereo Dataset Root (with left_images/ and disparity/ subfolders)")
+            self.source_path = filedialog.askdirectory(
+                title="Select Stereo Dataset Root (with left_images/ and disparity/ subfolders)"
+            )
             if not self.source_path:
                 self.mode_combo.set("Select Source...")
         elif mode == "ROS 2 Bag":
@@ -475,10 +631,15 @@ class DashboardGUI:
     def start_processing(self):
         selected_mode = self.mode_combo.get()
         if selected_mode == "Select Source...":
-            messagebox.showwarning("Source Not Selected", "Please select an input source.")
+            messagebox.showwarning(
+                "Source Not Selected", "Please select an input source."
+            )
             return
         if not self.model_configs:
-            messagebox.showerror("No Models", "No models loaded. Drop .onnx files into app/models/ and click ↻ Refresh Models.")
+            messagebox.showerror(
+                "No Models",
+                "No models loaded. Drop .onnx files into app/models/ and click ↻ Refresh Models.",
+            )
             return
         self._active_mode = selected_mode
         self._active_model_name = self.model_combo.get()
@@ -488,14 +649,15 @@ class DashboardGUI:
         self.process_button.config(text="Stop Processing")
         self.model_combo.config(state="disabled")
         self.mode_combo.config(state="disabled")
-        self.processing_thread = threading.Thread(target=self._processing_loop, daemon=True)
+        self.processing_thread = threading.Thread(
+            target=self._processing_loop, daemon=True
+        )
         self.processing_thread.start()
 
     def _start_bag_play(self, bag_path: str, rate: float = 1.0):
         """Launch ros2 bag play sebagai subprocess. Non-blocking."""
         self._stop_bag_play()  # pastikan tidak ada yang sedang jalan
-        cmd = ["ros2", "bag", "play", bag_path, "--loop",
-               "--rate", str(rate)]
+        cmd = ["ros2", "bag", "play", bag_path, "--loop", "--rate", str(rate)]
         try:
             self._bag_process = subprocess.Popen(
                 cmd,
@@ -504,8 +666,10 @@ class DashboardGUI:
             )
             print(f"[BagPlay] Started: {' '.join(cmd)}")
         except FileNotFoundError:
-            print("[BagPlay] ERROR: 'ros2' tidak ditemukan di PATH. "
-                  "Jalankan: source /opt/ros/humble/setup.bash")
+            print(
+                "[BagPlay] ERROR: 'ros2' tidak ditemukan di PATH. "
+                "Jalankan: source /opt/ros/humble/setup.bash"
+            )
             self._bag_process = None
 
     def _stop_bag_play(self):
@@ -543,35 +707,47 @@ class DashboardGUI:
         model_name = self._active_model_name
         set_active_model(model_name)
         if self.source_path is None:
-            self.master.after(0, lambda: messagebox.showerror("Error", "Source path is not set."))
+            self.master.after(
+                0, lambda: messagebox.showerror("Error", "Source path is not set.")
+            )
             self.master.after(0, self.stop_processing)
             return
 
         # --- Branch: Stereo Dataset Sim | ROS 2 Bag | standard video/image ---
-        is_stereo_sim = (mode == "Stereo Dataset Sim")
-        is_ros2_bag   = (mode == "ROS 2 Bag")
+        is_stereo_sim = mode == "Stereo Dataset Sim"
+        is_ros2_bag = mode == "ROS 2 Bag"
         stereo_loader = None
         source = None
 
         if is_stereo_sim:
             stereo_loader = StereoSimLoader(self.source_path)
             if not stereo_loader.is_opened():
-                self.master.after(0, lambda: messagebox.showerror(
-                    "Error",
-                    "No matching left_images/ and disparity/ .png pairs found in the selected folder."
-                ))
+                self.master.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "Error",
+                        "No matching left_images/ and disparity/ .png pairs found in the selected folder.",
+                    ),
+                )
                 self.master.after(0, self.stop_processing)
                 return
         elif is_ros2_bag:
-            from app.core.services.ros2_perception_node import ROSBagRunner, _ROS2_AVAILABLE
+            from app.core.services.ros2_perception_node import (
+                _ROS2_AVAILABLE,
+                ROSBagRunner,
+            )
+
             if not _ROS2_AVAILABLE:
-                self.master.after(0, lambda: messagebox.showerror(
-                    "ROS 2 Tidak Tersedia",
-                    "ROS 2 Python packages tidak ditemukan.\n\n"
-                    "Jalankan terlebih dahulu:\n"
-                    "    source /opt/ros/humble/setup.bash\n\n"
-                    "Lalu restart aplikasi."
-                ))
+                self.master.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "ROS 2 Tidak Tersedia",
+                        "ROS 2 Python packages tidak ditemukan.\n\n"
+                        "Jalankan terlebih dahulu:\n"
+                        "    source /opt/ros/humble/setup.bash\n\n"
+                        "Lalu restart aplikasi.",
+                    ),
+                )
                 self.master.after(0, self.stop_processing)
                 return
             try:
@@ -588,7 +764,12 @@ class DashboardGUI:
             if mode == "Webcam":
                 source.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             if not source.isOpened():
-                self.master.after(0, lambda: messagebox.showerror("Error", "Could not open video/image source."))
+                self.master.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "Error", "Could not open video/image source."
+                    ),
+                )
                 self.master.after(0, self.stop_processing)
                 return
 
@@ -602,13 +783,13 @@ class DashboardGUI:
 
         start_time = time.perf_counter()
         frames_read = 0
-        
+
         # --- BENCHMARKING VARS ---
         processed_frames_count = 0
         skipped_frames_count = 0
         latency_history = []
         fps_history = []
-            
+
         while not self.stop_processing_flag.is_set():
             # --- Read frame from the appropriate source ---
             simulated_depth = None
@@ -620,20 +801,22 @@ class DashboardGUI:
                 payload = self._ros_runner.get_frame(timeout=0.1)
                 if payload is None:
                     continue  # Tunggu bag play, jangan break
-                frame = payload['frame_bgr']
-                simulated_depth = payload['depth_m']
+                frame = payload["frame_bgr"]
+                simulated_depth = payload["depth_m"]
                 # Update calib dari CameraInfo (thread-safe karena overwrite atomic)
-                if payload['calib'] is not None:
-                    self._latest_calib = payload['calib']
+                if payload["calib"] is not None:
+                    self._latest_calib = payload["calib"]
                 ret = True
             else:
                 ret, frame = source.read()
                 if not ret:
                     break
-                
+
             frames_read += 1
             processed_frames_count += 1
-            latency, frame_fps = self.process_and_display_frame(frame, external_depth=simulated_depth)
+            latency, frame_fps = self.process_and_display_frame(
+                frame, external_depth=simulated_depth
+            )
             latency_history.append(latency)
             if frame_fps > 0:
                 fps_history.append(frame_fps)
@@ -646,7 +829,9 @@ class DashboardGUI:
                 else:
                     # If inference is slower than the source video, drop unread frames
                     # so preview timing stays aligned to the original video clock.
-                    frames_behind = int(abs(delay) / frame_interval) if frame_interval > 0 else 0
+                    frames_behind = (
+                        int(abs(delay) / frame_interval) if frame_interval > 0 else 0
+                    )
                     for _ in range(frames_behind):
                         if self.stop_processing_flag.is_set():
                             break
@@ -654,27 +839,29 @@ class DashboardGUI:
                             break
                         frames_read += 1
                         skipped_frames_count += 1
-            
+
             if mode == "Image File":
                 break
-        
+
         total_time = time.perf_counter() - start_time
         if source is not None:
             source.release()
-        
+
         if not self.stop_processing_flag.is_set():
             self.master.after(0, self.stop_processing)
-            
+
         # --- SHOW BENCHMARK RESULTS ---
         if mode == "Video File" and processed_frames_count > 0:
-            avg_latency = sum(latency_history) / len(latency_history) if latency_history else 0
+            avg_latency = (
+                sum(latency_history) / len(latency_history) if latency_history else 0
+            )
             max_latency = max(latency_history) if latency_history else 0
             min_latency = min(latency_history) if latency_history else 0
-            
+
             avg_fps = sum(fps_history) / len(fps_history) if fps_history else 0
             max_fps = max(fps_history) if fps_history else 0
             min_fps = min(fps_history) if fps_history else 0
-            
+
             benchmark_text = (
                 f"===== BENCHMARK RESULTS =====\n"
                 f"Model Used: {model_name}\n"
@@ -692,7 +879,9 @@ class DashboardGUI:
                 f"Max Latency: {max_latency:.0f} ms\n"
                 f"Min Latency: {min_latency:.0f} ms\n"
             )
-            self.master.after(0, lambda: messagebox.showinfo("Benchmark Results", benchmark_text))
+            self.master.after(
+                0, lambda: messagebox.showinfo("Benchmark Results", benchmark_text)
+            )
 
     def process_and_display_frame(self, frame_bgr, external_depth=None):
         if self._frame_img_w is None:
@@ -704,7 +893,7 @@ class DashboardGUI:
         # Path planning (A*) hanya dijalankan setiap _path_skip_interval frame.
         # Mengurangi beban CPU ~60% untuk path planning tanpa degradasi visual.
         self._frame_counter += 1
-        run_path = (self._frame_counter % self._path_skip_interval == 0)
+        run_path = self._frame_counter % self._path_skip_interval == 0
 
         use_mc = self.mc_dropout_var.get() and self.mc_pt_path is not None
         n_samples = int(self.mc_n_samples_var.get())
@@ -729,7 +918,12 @@ class DashboardGUI:
         if inference_error:
             if getattr(self, "_last_inference_error", None) != inference_error:
                 self._last_inference_error = inference_error
-                self.master.after(0, lambda: messagebox.showwarning("Inference Warning", inference_error))
+                self.master.after(
+                    0,
+                    lambda: messagebox.showwarning(
+                        "Inference Warning", inference_error
+                    ),
+                )
         else:
             self._last_inference_error = None
 
@@ -740,12 +934,17 @@ class DashboardGUI:
         show_unc = use_mc and self.show_uncertainty_var.get()
         path_data = results.get("path_planning")
         processed_frame = (
-            draw_main_visualization(frame_bgr.copy(), results, abs_poly,
-                                    show_uncertainty=show_unc,
-                                    path_data=path_data,
-                                    frame_shape=frame_bgr.shape[:2],
-                                    camera_intrinsics=self._latest_calib)
-            if self.show_polygon_enabled else frame_bgr
+            draw_main_visualization(
+                frame_bgr.copy(),
+                results,
+                abs_poly,
+                show_uncertainty=show_unc,
+                path_data=path_data,
+                frame_shape=frame_bgr.shape[:2],
+                camera_intrinsics=self._latest_calib,
+            )
+            if self.show_polygon_enabled
+            else frame_bgr
         )
         self._schedule_canvas_update(processed_frame)
         if external_depth is not None:
@@ -765,7 +964,9 @@ class DashboardGUI:
         mc_tag = f" | MC✓ N={n_samples}" if use_mc else ""
         status_text = f"FPS: {avg_fps:.1f} | Latency: {latency:.0f} ms{mc_tag}"
         weather_pred = results.get("weather_prediction", "N/A")
-        weather_text = weather_pred.capitalize() if weather_pred != "not_applicable" else "N/A"
+        weather_text = (
+            weather_pred.capitalize() if weather_pred != "not_applicable" else "N/A"
+        )
         self.master.after(0, self._update_status_labels, status_text, weather_text)
 
         # BEV juga diupdate setiap _bev_skip_interval frame
@@ -865,11 +1066,13 @@ class DashboardGUI:
 
             path_wpts = None
             if path_data and path_data.get("path_found"):
-                from app.core.services.object_detection import BEV_WIDTH, BEV_HEIGHT
+                from app.core.services.object_detection import BEV_HEIGHT, BEV_WIDTH
+
                 sx = canvas_w / BEV_WIDTH
                 sy = canvas_h / BEV_HEIGHT
-                path_wpts = [(int(wx * sx), int(wy * sy))
-                             for wx, wy in path_data["waypoints"]]
+                path_wpts = [
+                    (int(wx * sx), int(wy * sy)) for wx, wy in path_data["waypoints"]
+                ]
 
             # Dense point cloud BEV + detection overlay + path overlay
             bev_img = render_dense_bev(
@@ -878,24 +1081,45 @@ class DashboardGUI:
                 canvas_wh=(canvas_w, canvas_h),
                 detections_3d=dets_3d,
                 path_waypoints=path_wpts,
-                downsample=3,        # GPU: abaikan (full-density); CPU: ~11% piksel
+                downsample=3,  # GPU: abaikan (full-density); CPU: ~11% piksel
             )
 
             if path_data and not path_data.get("path_found"):
-                cv2.putText(bev_img, "NO PATH", (10, 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                cv2.putText(
+                    bev_img,
+                    "NO PATH",
+                    (10, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 0, 255),
+                    2,
+                )
         else:
             bev_img = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
             ego_px = canvas_w // 2
-            cv2.rectangle(bev_img, (ego_px - 8, canvas_h - 20),
-                          (ego_px + 8, canvas_h - 5), (0, 220, 220), -1)
-            cv2.putText(bev_img, "Waiting for depth...", (10, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+            cv2.rectangle(
+                bev_img,
+                (ego_px - 8, canvas_h - 20),
+                (ego_px + 8, canvas_h - 5),
+                (0, 220, 220),
+                -1,
+            )
+            cv2.putText(
+                bev_img,
+                "Waiting for depth...",
+                (10, 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (100, 100, 100),
+                1,
+            )
 
         self._latest_bev_frame = bev_img
         # Dispatch ke GUI thread — _update_canvas harus dipanggil dari main thread
         if self._active_view == "bev":
-            self.master.after(0, lambda img=bev_img: self._update_canvas(self.main_canvas, img))
+            self.master.after(
+                0, lambda img=bev_img: self._update_canvas(self.main_canvas, img)
+            )
 
     def _flush_ogm_update(self):
         grid = self._latest_ogm_grid
@@ -906,30 +1130,51 @@ class DashboardGUI:
         if grid is None:
             return
 
-        ogm_rgb = np.zeros((grid.shape[0], grid.shape[1], 3), dtype=np.uint8)
-        ogm_rgb[grid > 127] = [0, 255, 255]
-        ogm_rgb[grid > 200] = [0, 0, 255]
+        ogm_rgb = render_ogm_colormap(grid)
 
         if path_data and path_data.get("path_found"):
             waypoints = path_data.get("waypoints", [])
             for i in range(len(waypoints) - 1):
-                cv2.line(ogm_rgb,
-                         (int(waypoints[i][0]),   int(waypoints[i][1])),
-                         (int(waypoints[i+1][0]), int(waypoints[i+1][1])),
-                         (0, 200, 255), 2)
+                cv2.line(
+                    ogm_rgb,
+                    (int(waypoints[i][0]), int(waypoints[i][1])),
+                    (int(waypoints[i + 1][0]), int(waypoints[i + 1][1])),
+                    (0, 200, 255),
+                    2,
+                )
             if waypoints:
-                cv2.circle(ogm_rgb, (int(waypoints[0][0]),  int(waypoints[0][1])),  4, (255, 255, 0), -1)
-                cv2.circle(ogm_rgb, (int(waypoints[-1][0]), int(waypoints[-1][1])), 4, (0, 255, 0),   -1)
+                cv2.circle(
+                    ogm_rgb,
+                    (int(waypoints[0][0]), int(waypoints[0][1])),
+                    4,
+                    (255, 255, 0),
+                    -1,
+                )
+                cv2.circle(
+                    ogm_rgb,
+                    (int(waypoints[-1][0]), int(waypoints[-1][1])),
+                    4,
+                    (0, 255, 0),
+                    -1,
+                )
 
         h, w = ogm_rgb.shape[:2]
         # Draw ego vehicle as a vertical rectangle (narrow lateral, longer forward)
         ego_cx = w // 2
         ego_w, ego_h = 8, 18  # ~1m wide, ~2.2m long in BEV scale
-        cv2.rectangle(ogm_rgb, (ego_cx - ego_w // 2, h - ego_h - 2), (ego_cx + ego_w // 2, h - 2), (0, 180, 180), -1)
+        cv2.rectangle(
+            ogm_rgb,
+            (ego_cx - ego_w // 2, h - ego_h - 2),
+            (ego_cx + ego_w // 2, h - 2),
+            (0, 180, 180),
+            -1,
+        )
 
         self._latest_ogm_frame = ogm_rgb
         if self._active_view == "ogm":
-            self.master.after(0, lambda img=ogm_rgb: self._update_canvas(self.main_canvas, img))
+            self.master.after(
+                0, lambda img=ogm_rgb: self._update_canvas(self.main_canvas, img)
+            )
 
     def _update_canvas(self, widget, frame_bgr):
         target_w, target_h = widget.winfo_width(), widget.winfo_height()
@@ -943,17 +1188,19 @@ class DashboardGUI:
         frame_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         img_tk = ImageTk.PhotoImage(image=Image.fromarray(frame_rgb))
         if self._canvas_image_id is None:
-            self._canvas_image_id = widget.create_image(target_w / 2, target_h / 2, image=img_tk, anchor=tk.CENTER)
+            self._canvas_image_id = widget.create_image(
+                target_w / 2, target_h / 2, image=img_tk, anchor=tk.CENTER
+            )
         else:
             widget.coords(self._canvas_image_id, target_w / 2, target_h / 2)
             widget.itemconfig(self._canvas_image_id, image=img_tk)
         widget.image = img_tk  # prevent garbage collection
 
     def _update_dummy_data(self):
-        speed   = f"{random.randint(20, 40)} Km/h"
+        speed = f"{random.randint(20, 40)} Km/h"
         battery = f"{random.randint(70, 95)} %"
-        lat     = f"{random.uniform(-6.1, -6.3):.4f}"
-        lon     = f"{random.uniform(106.7, 106.9):.4f}"
+        lat = f"{random.uniform(-6.1, -6.3):.4f}"
+        lon = f"{random.uniform(106.7, 106.9):.4f}"
         self.speed_label.config(text=speed)
         self.battery_label.config(text=battery)
         self.location_label.config(text=f"{lat}, {lon}")

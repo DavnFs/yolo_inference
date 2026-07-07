@@ -20,6 +20,7 @@ A real-time autonomous driving perception system built in Python/Tkinter that pe
 - [Data Flow Pipeline](#data-flow-pipeline)
 - [Custom Model Architecture](#custom-model-architecture)
 - [Stereo Depth Pipeline](#stereo-depth-pipeline)
+- [Simulation vs. Hardware](#simulation-vs-hardware)
 - [Path Planning Algorithm](#path-planning-algorithm)
 - [BEV & OGM Visualization](#bev--ogm-visualization)
 - [Model Management & Auto-Discovery](#model-management--auto-discovery)
@@ -493,6 +494,17 @@ Per-detection override: sample 20th percentile from bbox patch
 - Monocular depth estimation (Depth Anything V2) produces relative depth, not metric distance
 - Stereo disparity directly yields physical distance via the calibrated baseline formula
 - The path planning grid requires accurate meter-scale distances for BEV projection, hazard classification, and obstacle sizing
+
+---
+
+## Simulation vs. Hardware
+
+This repository is a **simulation harness for an undergraduate thesis on autonomous driving perception**, not a finished hardware integration. It is important to be explicit about what is real and what is a stand-in:
+
+- **Current implementation**: depth comes from pre-computed `.npy` / 16-bit disparity files (DrivingStereo / KITTI-derived), loaded from disk by `StereoSimLoader`. There is no live camera or stereo matching happening at runtime — the "depth sensor" is a recorded dataset played back frame by frame.
+- **Target hardware**: a ZED 2i stereo camera. The ZED SDK computes per-pixel depth directly on-device and additionally provides a **confidence map** for each depth pixel, which this simulation has no equivalent for (every `.npy` pixel is treated as equally trustworthy).
+- **Parameter recalibration required for hardware**: the depth tolerance ratios, ground-plane model, and road/vegetation segmentation thresholds in `path_planning.py` are tuned against KITTI-scale depth noise and geometry. Moving to ZED 2i will require re-deriving `camera_height_m`, `fx`, `fy`, `cx`, and `cy` in `app/core/config.py` (`CAMERA_PROFILES["ZED_2I"]`) using the unit's factory calibration, rather than reusing the KITTI values.
+- **Known limitation**: road vs. sidewalk/vegetation discrimination degrades when the depth source is estimated (monocular) rather than true stereo, since flat, coplanar surfaces (asphalt, sidewalk, grass) can be geometrically indistinguishable. ZED 2i's native stereo depth plus its per-pixel confidence map is expected to reduce this ambiguity by letting low-confidence, noisy readings near object/surface boundaries be filtered out before they reach the occupancy grid.
 
 ---
 
